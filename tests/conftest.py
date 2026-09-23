@@ -10,6 +10,20 @@ from typing import Union
 import importlib.util
 import pytest
 
+# Test modules that require optional third-party packages must not break
+# collection when those packages are absent (the minimal install only has
+# pytest + pytest-asyncio). Skip collecting them, mirroring the find_spec
+# guards used for the bucket fixtures below.
+_OPTIONAL_MODULE_DEPS = {
+    "test_aiohttp_limiter.py": "aiohttp",
+}
+
+collect_ignore = [
+    filename
+    for filename, package in _OPTIONAL_MODULE_DEPS.items()
+    if importlib.util.find_spec(package) is None
+]
+
 from pyrate_limiter import Duration
 from pyrate_limiter import id_generator
 from pyrate_limiter import InMemoryBucket

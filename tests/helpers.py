@@ -9,8 +9,50 @@ from typing import Tuple
 
 from .conftest import logger
 from pyrate_limiter import AbstractBucket
+from pyrate_limiter import InMemoryBucket
 from pyrate_limiter import Limiter
 from pyrate_limiter import RateItem
+
+
+class TransientBucketError(RuntimeError):
+    """Recoverable bucket failure injected by the regression suite."""
+
+
+class FlakyBucket(InMemoryBucket):
+    """InMemoryBucket whose put() raises scripted, recoverable errors.
+
+    Failure-injection seam for the regression suite: errors are queued with
+    ``pending_errors`` and raised from the public ``put()``, so every failure
+    still enters through the limiter's normal acquire path - no internal
+    objects are forged.
+    """
+
+    def __init__(self, rates, clock=None):
+        super().__init__(rates, clock=clock)
+        self.pending_errors: List[Exception] = []
+
+    def put(self, item):
+        if self.pending_errors:
+            raise self.pending_errors.pop(0)
+        return super().put(item)
+
+
+def bucket_snapshot(bucket: AbstractBucket) -> Tuple:
+    """Comparable, printable snapshot of the invariants that prove
+    rate-limit / virtual-clock semantics: how many units are stored, which
+    rate last denied (if any), and every stored item newest-first.
+    """
+    count = bucket.count()
+    assert isinstance(count, int)
+    items = []
+
+    for index in range(count):
+        item = bucket.peek(index)
+        assert isinstance(item, RateItem)
+        items.append((item.name, item.timestamp, item.weight))
+
+    failing = None if bucket.failing_rate is None else (bucket.failing_rate.limit, bucket.failing_rate.interval)
+    return count, failing, tuple(items)
 
 
 async def inspect_bucket_items(bucket: AbstractBucket, expected_item_count: int):

@@ -62,8 +62,42 @@ class AbstractBucket(ABC):
         self._rates = ordered
 
     def now(self):
-        """Retrieve current timestamp from the clock backend."""
-        return self._clock.now()
+        """Retrieve current timestamp from the clock backend.
+
+        The value never decreases across reads of the same bucket: a clock
+        backend that briefly moves backwards (NTP step, manually rewound
+        virtual clock) is treated as "no time has passed". This is the single
+        clock-read boundary shared by the sync and async acquire paths, so
+        both observe the same regression policy and the bucket's internal
+        ordering (e.g. InMemoryBucket's timestamp-sorted log) can never be
+        corrupted by a stale timestamp.
+        """
+        ts = self._clock.now()
+
+        if isawaitable(ts):
+
+            async def _clamped() -> int:
+                return self._clamp_now(await ts)
+
+            return _clamped()
+
+        return self._clamp_now(ts)
+
+    def _clamp_now(self, ts: int) -> int:
+        """Monotonic guard for ``now()``; see its docstring for the policy.
+
+        Lock-free on purpose: a racing pair of reads may disagree on which of
+        two close values becomes the floor, but every returned value stays a
+        real clock read and the floor never moves backwards, so window math
+        is unaffected.
+        """
+        last = self.__dict__.get("_last_now")
+
+        if last is not None and ts < last:
+            return last
+
+        self.__dict__["_last_now"] = ts
+        return ts
 
     def _record(self, item: RateItem, decision: Decision) -> bool:
         """Store a put()'s verdict; return whether it was admitted.

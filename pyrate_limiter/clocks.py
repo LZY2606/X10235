@@ -62,6 +62,35 @@ class MonotonicAsyncClock(AbstractClock):
         return self._get_monotonic_ms()
 
 
+class VirtualClock(AbstractClock):
+    """Manually advanced monotonic clock - meant for testing only.
+
+    Time stands still unless the test moves it, so window boundaries can be
+    hit exactly instead of slept towards. ``advance()`` enforces the
+    monotonic contract; ``rewind()`` exists solely to inject a clock
+    regression - buckets treat a backward read as "no time has passed"
+    (see ``AbstractBucket.now``), which is the policy under test then.
+    """
+
+    def __init__(self, start_ms: int = 0):
+        self._t = start_ms
+
+    def now(self) -> int:
+        return self._t
+
+    def advance(self, ms: int) -> int:
+        """Move time forward; negative deltas are rejected (monotonic)."""
+        if ms < 0:
+            raise ValueError("VirtualClock is monotonic; use rewind() to inject a clock regression")
+        self._t += ms
+        return self._t
+
+    def rewind(self, ms: int) -> int:
+        """Move time backwards - fault injection for clock-regression tests."""
+        self._t -= ms
+        return self._t
+
+
 class PostgresClock(AbstractClock):
     """Get timestamp using Postgres as remote clock backend"""
 
