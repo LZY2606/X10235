@@ -5,6 +5,8 @@ from operator import attrgetter
 from threading import RLock
 from typing import List, Optional
 
+from ..clocks import AbstractClock
+
 from ..abstracts.algorithm import ADMITTED, Decision, LogAlgorithm
 from ..abstracts.bucket import AbstractBucket
 from ..abstracts.rate import Rate, RateItem
@@ -26,11 +28,21 @@ class InMemoryBucket(AbstractBucket):
     failing_rate: Optional[Rate]
     is_async = False
 
-    def __init__(self, rates: List[Rate], algorithm: Optional[LogAlgorithm] = None):
+    def __init__(
+        self,
+        rates: List[Rate],
+        algorithm: Optional[LogAlgorithm] = None,
+        clock: Optional[AbstractClock] = None,
+    ):
         super().__init__()
 
         if algorithm is not None:
             self._algorithm = algorithm
+        if clock is not None:
+            # Per-instance clock so tests can drive one bucket with a virtual
+            # clock without leaking into any other bucket/limiter. The
+            # default stays the inherited class-level MonotonicClock.
+            self._clock = clock
 
         self.rates = rates  # AbstractBucket.rates setter sorts + validates
         self.items = []

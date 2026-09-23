@@ -62,6 +62,66 @@ class MonotonicAsyncClock(AbstractClock):
         return self._get_monotonic_ms()
 
 
+class ClockMovedBackward(ValueError):
+    """Raised when a monotonic clock is asked to move backwards.
+
+    Monotonic clocks only advance; callers that observe time going backwards
+    (e.g. a test driver feeding a smaller timestamp) get an explicit, stable
+    error instead of silently corrupting window math. Subclasses ``ValueError``
+    so it stays inside the library's built-in error layering.
+    """
+
+
+class VirtualClock(AbstractClock):
+    """Deterministic monotonic clock for tests and simulations.
+
+    Time stands still until :meth:`advance` moves it forward by a fixed number
+    of milliseconds; both the sync and async entry points then report that same
+    value. This is what makes blocking acquire loops reproducible: pair it with
+    a virtual sleep seam (the Limiter's test clock seam) and waiting only
+    happens when the driver explicitly advances time.
+
+    ``now()`` is synchronous (matching :class:`MonotonicClock`); awaiting the
+    int is harmless because the async limiter normalizes non-awaitable values.
+    Moving backwards is rejected with :class:`ClockMovedBackward` so the
+    monotonic policy is consistent across every consumer.
+    """
+
+    def __init__(self, start_ms: int = 0):
+        self._now_ms = int(start_ms)
+
+    def now(self) -> int:
+        """Current virtual time in milliseconds."""
+        return self._now_ms
+
+    def advance(self, delta_ms: int) -> int:
+        """Advance virtual time by ``delta_ms`` milliseconds (must be >= 0).
+
+        Returns the new virtual time. A negative delta raises
+        :class:`ClockMovedBackward` rather than rewinding: stored bucket
+        timestamps and limiter deadlines share this one clock, so a rewind
+        could make admitted items appear "in the future" and silently relax
+        limits.
+        """
+        if delta_ms < 0:
+            msg = f"virtual clock cannot move backwards by {-delta_ms}ms"
+            raise ClockMovedBackward(msg)
+        self._now_ms += int(delta_ms)
+        return self._now_ms
+
+    def reset(self, start_ms: int = 0) -> None:
+        """Reset to an explicit timestamp.
+
+        Intended for fresh-test setup only - unlike :meth:`advance`, resetting
+        to an earlier timestamp raises :class:`ClockMovedBackward`, so even an
+        explicit reset cannot silently turn the clock backwards.
+        """
+        if start_ms < self._now_ms:
+            msg = f"virtual clock cannot reset backwards: {start_ms} < {self._now_ms}"
+            raise ClockMovedBackward(msg)
+        self._now_ms = int(start_ms)
+
+
 class PostgresClock(AbstractClock):
     """Get timestamp using Postgres as remote clock backend"""
 

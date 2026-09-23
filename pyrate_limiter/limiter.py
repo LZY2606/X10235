@@ -21,6 +21,48 @@ DecoratorWrapper = Callable[[Callable[[Any], Any]], Callable[[Any], Any]]
 _UNSET: Any = object()
 
 
+class TimeSeam(Protocol):
+    """Single boundary for everything the Limiter needs from the clock:
+    reading "now" (seconds, float) and suspending the caller.
+
+    The sync and async acquire paths are identical except for the wait
+    primitive, so both take their time from one seam instead of reaching for
+    ``time.monotonic`` / ``time.sleep`` / ``asyncio.sleep`` separately. The
+    production seam reads the real monotonic clock; tests inject a virtual
+    clock whose ``asleep`` parks until the driver advances virtual time, which
+    makes blocking waits deterministic without duplicating any acquire logic.
+    """
+
+    def now(self) -> float: ...
+
+    def sleep(self, seconds: float) -> None: ...
+
+    def asleep(self, seconds: float) -> Awaitable[None]: ...
+
+
+class _SystemTimeSeam:
+    """Production :class:`TimeSeam`: real monotonic time, real waits."""
+
+    __slots__ = ()
+
+    def now(self) -> float:
+        return monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        sleep(seconds)
+
+    async def asleep(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
+
+
+_SYSTEM_TIME = _SystemTimeSeam()
+
+#: Exception kinds the public acquire calls translate into ``False``.
+#: One tuple shared by every sync/async conversion point so the mapping cannot
+#: drift between them. Anything else (including bucket errors) propagates.
+_TIMEOUT_EXCEPTIONS = (TimeoutError, asyncio.TimeoutError)
+
+
 class LockLike(Protocol):
     def acquire(self, blocking: bool = ..., timeout: Union[float, int, None] = ...) -> bool: ...
     def release(self) -> None: ...
