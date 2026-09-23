@@ -1,6 +1,6 @@
 """Naive bucket implementation using built-in list"""
 
-from bisect import bisect_left
+from bisect import bisect_left, insort_right
 from operator import attrgetter
 from threading import RLock
 from typing import List, Optional
@@ -8,6 +8,7 @@ from typing import List, Optional
 from ..abstracts.algorithm import ADMITTED, Decision, LogAlgorithm
 from ..abstracts.bucket import AbstractBucket
 from ..abstracts.rate import Rate, RateItem
+from ..clocks import AbstractClock
 
 # Items are kept sorted by timestamp ascending; key for bisect lookups.
 _by_timestamp = attrgetter("timestamp")
@@ -26,11 +27,16 @@ class InMemoryBucket(AbstractBucket):
     failing_rate: Optional[Rate]
     is_async = False
 
-    def __init__(self, rates: List[Rate], algorithm: Optional[LogAlgorithm] = None):
+    def __init__(self, rates: List[Rate], algorithm: Optional[LogAlgorithm] = None, clock: Optional[AbstractClock] = None):
         super().__init__()
 
         if algorithm is not None:
             self._algorithm = algorithm
+
+        if clock is not None:
+            # Test/diagnostic seam: routes through the same AbstractBucket.now()
+            # read path every operation uses in production.
+            self.clock = clock
 
         self.rates = rates  # AbstractBucket.rates setter sorts + validates
         self.items = []
@@ -71,10 +77,12 @@ class InMemoryBucket(AbstractBucket):
 
             self._record(item, ADMITTED)
 
-            if item.weight > 1:
-                self.items.extend([item for _ in range(item.weight)])
-            else:
-                self.items.append(item)
+            # Sorted insert, not append: with a non-monotonic clock source
+            # (skew, force_set) an item's timestamp may be older than the
+            # tail's, and the bisect lookups above require the list to stay
+            # sorted by timestamp or window counts silently corrupt.
+            for _ in range(item.weight):
+                insort_right(self.items, item, key=_by_timestamp)
 
             return True
 

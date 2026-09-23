@@ -62,6 +62,42 @@ class MonotonicAsyncClock(AbstractClock):
         return self._get_monotonic_ms()
 
 
+class MonotonicVirtualClock(AbstractClock):
+    """Manually advanced monotonic clock, meant for testing only.
+
+    ``now()`` never moves on its own and never goes backwards through
+    ``advance()``; the only way to move it backwards is the explicit
+    ``force_set()`` (e.g. a test simulating clock skew). Inject it into a
+    bucket via ``bucket.clock = ...`` (or the ``clock=`` constructor
+    argument); the bucket then reads it through the exact same
+    ``AbstractBucket.now()`` path used in production - there is no
+    separate test-only time source.
+    """
+
+    def __init__(self, start_ms: int = 0):
+        self._now_ms = start_ms
+
+    def now(self) -> int:
+        """Get the current virtual time in milliseconds"""
+        return self._now_ms
+
+    def advance(self, delta_ms: int) -> int:
+        """Move virtual time forward; returns the new reading.
+
+        Moving forward is the only monotonic direction; use ``force_set``
+        for deliberate time travel.
+        """
+        if delta_ms < 0:
+            raise ValueError("advance() only moves forward; use force_set() for deliberate time travel")
+        self._now_ms += delta_ms
+        return self._now_ms
+
+    def force_set(self, timestamp_ms: int) -> int:
+        """Set the reading directly, including backwards (clock skew)."""
+        self._now_ms = timestamp_ms
+        return self._now_ms
+
+
 class PostgresClock(AbstractClock):
     """Get timestamp using Postgres as remote clock backend"""
 

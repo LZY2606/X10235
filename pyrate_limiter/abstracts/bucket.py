@@ -65,6 +65,21 @@ class AbstractBucket(ABC):
         """Retrieve current timestamp from the clock backend."""
         return self._clock.now()
 
+    @property
+    def clock(self) -> AbstractClock:
+        """The clock this bucket reads ``now()`` from."""
+        return self._clock
+
+    @clock.setter
+    def clock(self, value: AbstractClock) -> None:
+        """Swap the clock backend (e.g. inject a MonotonicVirtualClock in
+        tests). This is the single seam through which every bucket operation
+        (``put``/``leak``/``waiting``) reads time, so an injected clock feeds
+        the exact production read path - not a parallel one.
+        """
+        assert isinstance(value, AbstractClock), "clock must be an AbstractClock"
+        self._clock = value
+
     def _record(self, item: RateItem, decision: Decision) -> bool:
         """Store a put()'s verdict; return whether it was admitted.
 
