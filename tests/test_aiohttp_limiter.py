@@ -1,6 +1,9 @@
 """Tests for aiohttp_limiter close() method"""
 import pytest
 from pyrate_limiter import Limiter, Rate
+
+aiohttp = pytest.importorskip("aiohttp", reason="aiohttp extra not installed")
+
 from pyrate_limiter.extras.aiohttp_limiter import RateLimitedSession
 from .conftest import DEFAULT_RATES
 

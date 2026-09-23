@@ -1,13 +1,16 @@
 """Naive bucket implementation using built-in list"""
 
-from bisect import bisect_left
+from bisect import bisect_left, insort_right
 from operator import attrgetter
 from threading import RLock
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from ..abstracts.algorithm import ADMITTED, Decision, LogAlgorithm
 from ..abstracts.bucket import AbstractBucket
 from ..abstracts.rate import Rate, RateItem
+
+if TYPE_CHECKING:
+    from ..clocks import AbstractClock
 
 # Items are kept sorted by timestamp ascending; key for bisect lookups.
 _by_timestamp = attrgetter("timestamp")
@@ -26,11 +29,16 @@ class InMemoryBucket(AbstractBucket):
     failing_rate: Optional[Rate]
     is_async = False
 
-    def __init__(self, rates: List[Rate], algorithm: Optional[LogAlgorithm] = None):
+    def __init__(self, rates: List[Rate], algorithm: Optional[LogAlgorithm] = None, clock: Optional["AbstractClock"] = None):
         super().__init__()
 
         if algorithm is not None:
             self._algorithm = algorithm
+
+        if clock is not None:
+            # Instance attribute, never the class-level default: clocks must
+            # not leak across buckets/limiters sharing this process.
+            self._clock = clock
 
         self.rates = rates  # AbstractBucket.rates setter sorts + validates
         self.items = []
@@ -70,13 +78,28 @@ class InMemoryBucket(AbstractBucket):
                     return self._record(item, self._deny(rate, item, current_length))
 
             self._record(item, ADMITTED)
-
-            if item.weight > 1:
-                self.items.extend([item for _ in range(item.weight)])
-            else:
-                self.items.append(item)
-
+            self._store(item)
             return True
+
+    def _store(self, item: RateItem) -> None:
+        """Append ``item.weight`` copies of ``item``, keeping ``self.items``
+        sorted by timestamp ascending.
+
+        The plain append/extend fast path covers the normal non-decreasing
+        clock. A regressed clock (NTP jump, test virtual clock rewound) yields
+        an out-of-order timestamp; inserting it sorted instead of appending
+        keeps every bisect/leak/peek invariant intact, so a backwards clock
+        can delay admissions but can never over-admit beyond the rate limit -
+        the bucket's consistent clock-regression policy.
+        """
+        copies = item.weight if item.weight > 1 else 1
+
+        if not self.items or item.timestamp >= self.items[-1].timestamp:
+            self.items.extend([item] * copies)
+            return
+
+        for _ in range(copies):
+            insort_right(self.items, item, key=_by_timestamp)
 
     def _deny(self, rate: Rate, item: RateItem, length: int) -> Decision:
         """Denial verdict, resolving the wait from the items already in hand
