@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable, Iterable, List, Optional, Protocol,
 
 from .abstracts import AbstractBucket, BucketFactory, Rate, RateItem
 from .buckets import InMemoryBucket
+from .clocks import AbstractClock, MonotonicClock
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,7 @@ def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeo
                 lock.release()
 
 
-def _plan_delay_step(deadline: Optional[float], delay_ms: Union[int, float]) -> Tuple[float, bool]:
+def _plan_delay_step(now_ms: float, deadline_ms: Optional[float], delay_ms: Union[int, float]) -> Tuple[float, bool]:
     """Plan one delay step for `_delay_waiter`.
 
     Returns ``(seconds_to_sleep, raise_timeout_after_sleep)``. Raises
@@ -113,10 +114,11 @@ def _plan_delay_step(deadline: Optional[float], delay_ms: Union[int, float]) -> 
     passed. This is the deadline math shared verbatim by the sync and async
     branches of `_delay_waiter`; the caller performs the actual sleep with its
     own primitive (`time.sleep` vs `asyncio.sleep`) and re-raises afterwards.
+    All times are milliseconds on the limiter's (possibly injected) clock.
     """
-    if deadline is None:
+    if deadline_ms is None:
         return delay_ms / 1000, False
-    remaining_ms = (deadline - monotonic()) * 1000
+    remaining_ms = deadline_ms - now_ms
     if remaining_ms <= 0:
         raise TimeoutError()
     if remaining_ms < delay_ms:
@@ -132,6 +134,7 @@ class Limiter:
     bucket_factory: BucketFactory
     lock: Union[RLock, Iterable]
     buffer_ms: int
+    _clock: AbstractClock
 
     # async_lock is thread local, created on first use
     _thread_local: local
@@ -140,15 +143,22 @@ class Limiter:
         self,
         argument: Union[BucketFactory, AbstractBucket, Rate, List[Rate]],
         buffer_ms: int = 50,
+        clock: Optional[AbstractClock] = None,
     ):
         """Init Limiter using either a single bucket / multiple-bucket factory
         / single rate / rate list.
 
         Parameters:
             argument (Union[BucketFactory, AbstractBucket, Rate, List[Rate]]): The bucket or rate configuration.
+            clock (Optional[AbstractClock]): Clock backing all deadline/timeout
+                accounting. Defaults to MonotonicClock. Must be synchronous;
+                tests may inject a VirtualClock to drive deadlines manually.
+                Actual sleeping always uses the real sync/async sleep
+                primitives regardless of the injected clock.
         """
 
         self.buffer_ms = buffer_ms
+        self._clock = clock or MonotonicClock()
         self.bucket_factory = self._init_bucket_factory(argument)
         self.lock = RLock()
         self._thread_local = local()
@@ -189,6 +199,30 @@ class Limiter:
 
         return argument
 
+    def _now_ms(self) -> float:
+        """The single clock read behind every deadline computation.
+
+        The injected clock must be synchronous: an awaitable reading is
+        unsupported and rejected explicitly rather than silently mis-timed.
+        """
+        now = self._clock.now()
+
+        if isawaitable(now):
+            if iscoroutine(now):
+                now.close()
+            raise RuntimeError("Limiter clock must be synchronous")
+
+        return now
+
+    @staticmethod
+    def _validate_acquire_args(blocking: bool, timeout: Union[int, float]) -> None:
+        """Entry validation shared by ``try_acquire`` and ``try_acquire_async``."""
+        if timeout < 0 and timeout != -1:
+            raise ValueError("timeout must be -1 or >= 0")
+
+        if not blocking and timeout != -1:
+            raise RuntimeError("Can't set timeout with non-blocking")
+
     def _delay_to_sleep_ms(self, delay: int) -> Optional[int]:
         """Translate a ``bucket.waiting()`` result into milliseconds to sleep
         before re-attempting the put.
@@ -205,6 +239,33 @@ class Limiter:
             delay = 0
         return delay + self.buffer_ms
 
+    def _delay_plan(self, item: RateItem, wait_ms: int, deadline: Optional[float]):
+        """The blocking-wait schedule shared by the sync and async delay loops.
+
+        A generator driving the acquire-retry protocol: each yield hands the
+        caller ``(seconds_to_sleep, raise_timeout_after_sleep)``; the caller
+        sleeps with its own primitive (``time.sleep`` vs ``asyncio.sleep``),
+        re-puts the item however its path requires, and sends back
+        ``(acquired, next_wait_ms)`` with both values already resolved (never
+        awaitables). The final outcome arrives as ``StopIteration.value``.
+        ``TimeoutError`` propagates out of ``next()``/``send()`` when the
+        deadline passes. Centralizing the buffer translation, deadline math
+        and timestamp bump here keeps the sync and async drivers line-for-line
+        equivalent.
+        """
+        while True:
+            sleep_ms = self._delay_to_sleep_ms(wait_ms)
+
+            if sleep_ms is None:
+                return False
+
+            secs, timed_out = _plan_delay_step(self._now_ms(), deadline, sleep_ms)
+            item.timestamp += sleep_ms
+            acquired, wait_ms = yield secs, timed_out
+
+            if acquired:
+                return True
+
     def _delay_waiter(
         self, bucket: AbstractBucket, item: RateItem, blocking: bool, _force_async: bool = False, deadline: Optional[float] = None
     ) -> Union[bool, Awaitable[bool]]:
@@ -214,81 +275,51 @@ class Limiter:
         if not blocking:
             return False
 
-        delay = bucket.waiting(item)
+        wait = bucket.waiting(item)
 
-        if _force_async or isawaitable(delay):
+        if _force_async or isawaitable(wait):
+            return self._delay_wait_async(bucket, item, wait, deadline=deadline)
 
-            async def _handle_async(delay):
-                while True:
-                    if deadline is not None:
-                        remaining_ms = (deadline - monotonic()) * 1000
-                        if remaining_ms <= 0:
-                            raise TimeoutError()
+        assert isinstance(wait, int)
+        return self._blocking_retry_sync(bucket, item, wait, blocking=blocking, deadline=deadline)
 
-                    d = await self._handle_async_result(delay, deadline=deadline) if isawaitable(delay) else delay
-                    assert isinstance(d, int)
-                    sleep_ms = self._delay_to_sleep_ms(d)
-                    if sleep_ms is None:
-                        return False
-                    d = sleep_ms
+    async def _delay_wait_async(
+        self, bucket: AbstractBucket, item: RateItem, wait: Union[int, Awaitable[int]], deadline: Optional[float] = None
+    ) -> bool:
+        """Async driver over the shared `_delay_plan` schedule.
 
-                    secs, timed_out = _plan_delay_step(deadline, d)
-                    await asyncio.sleep(secs)
-                    if timed_out:
-                        raise TimeoutError()
+        Resolves awaitable ``waiting()``/``put()`` results each round and
+        sleeps with ``asyncio.sleep``; the schedule itself (buffer, deadline,
+        timestamp bump) comes from the same generator the sync path uses.
+        """
+        wait = await self._handle_async_result(wait, deadline=deadline)
+        assert isinstance(wait, int)
 
-                    item.timestamp += d
-                    r = bucket.put(item)
-                    r = await r if isawaitable(r) else r
-                    if r:
-                        return True
-                    delay = bucket.waiting(item)
+        plan = self._delay_plan(item, wait, deadline)
 
-            return _handle_async(delay)
-        else:
-            total_delay = 0
+        try:
+            step = next(plan)
+        except StopIteration as stop:
+            return stop.value
 
-            while True:
-                assert not isawaitable(delay)
-                logger.debug("delay=%d, total_delay=%s", delay, total_delay)
+        while True:
+            secs, timed_out = step
+            await asyncio.sleep(secs)
 
-                sleep_ms = self._delay_to_sleep_ms(delay)
-                if sleep_ms is None:
-                    return False
-                delay = sleep_ms
-                total_delay += delay
+            if timed_out:
+                plan.close()
+                raise TimeoutError()
 
-                secs, timed_out = _plan_delay_step(deadline, delay)
-                sleep(secs)
-                if timed_out:
-                    raise TimeoutError()
+            acquired = await self._handle_async_result(bucket.put(item), deadline=deadline)
 
-                item.timestamp += delay
-                re_acquire = bucket.put(item)
+            if not acquired:
+                wait = await self._handle_async_result(bucket.waiting(item), deadline=deadline)
+                assert isinstance(wait, int)
 
-                if isawaitable(re_acquire):
-
-                    async def _resume_async(re_acquire):
-                        reacquired = await self._handle_async_result(re_acquire, deadline=deadline)
-                        if reacquired:
-                            return True
-
-                        continued = self._delay_waiter(
-                            bucket,
-                            item,
-                            blocking=blocking,
-                            _force_async=True,
-                            deadline=deadline,
-                        )
-                        return await self._handle_async_result(continued, deadline=deadline)
-
-                    return _resume_async(re_acquire)
-
-                assert isinstance(re_acquire, bool)
-
-                if re_acquire:
-                    return True
-                delay = bucket.waiting(item)
+            try:
+                step = plan.send((bool(acquired), wait))
+            except StopIteration as stop:
+                return stop.value
 
     def handle_bucket_put(
         self, bucket: AbstractBucket, item: RateItem, blocking: bool, _force_async: bool = False, deadline: Optional[float] = None
@@ -333,19 +364,25 @@ class Limiter:
         window, and the loop re-checks on wake, so a stale duration costs at most
         one extra retry - never correctness. Releasing the lock means a long
         wait on one key no longer serializes acquisitions for other keys (#301).
+        The schedule itself comes from `_delay_plan`, the same generator the
+        async delay loop drives.
         """
-        while True:
-            sleep_ms = self._delay_to_sleep_ms(wait_ms)
-            if sleep_ms is None:
-                return False
+        plan = self._delay_plan(item, wait_ms, deadline)
 
-            secs, timed_out = _plan_delay_step(deadline, sleep_ms)
+        try:
+            step = next(plan)
+        except StopIteration as stop:
+            return stop.value
+
+        while True:
+            secs, timed_out = step
             sleep(secs)  # lock intentionally NOT held during the sleep
+
             if timed_out:
+                plan.close()
                 raise TimeoutError()
 
-            item.timestamp += sleep_ms
-            remaining: Union[int, float] = -1 if deadline is None else max(0.0, deadline - monotonic())
+            remaining: Union[int, float] = -1 if deadline is None else max(0.0, (deadline - self._now_ms()) / 1000)
 
             with combined_lock(self.lock, blocking=True, timeout=remaining):
                 re_acquire = bucket.put(item)
@@ -353,17 +390,23 @@ class Limiter:
                 if isawaitable(re_acquire):
                     # Pathological: a nominally-sync bucket returned an awaitable
                     # mid-wait. Hand off to the async tail (lock released on return).
+                    plan.close()
                     return self._handle_async_result(
                         self._wait_after_async_put(bucket, item, re_acquire, blocking=blocking, deadline=deadline),
                         deadline=deadline,
                     )
 
-                if re_acquire:
-                    return True
+                assert isinstance(re_acquire, bool)
 
-                next_wait = bucket.waiting(item)
-                assert isinstance(next_wait, int)
-                wait_ms = next_wait
+                if not re_acquire:
+                    next_wait = bucket.waiting(item)
+                    assert isinstance(next_wait, int)
+                    wait_ms = next_wait
+
+            try:
+                step = plan.send((re_acquire, wait_ms))
+            except StopIteration as stop:
+                return stop.value
 
     def _get_async_lock(self):
         """Returns thread_local, loop-specific lock"""
@@ -402,11 +445,7 @@ class Limiter:
             True if the permit was acquired, False otherwise. Async limiters
             return an awaitable resolving to the same.
         """
-        if timeout < 0 and timeout != -1:
-            raise ValueError("timeout must be -1 or >= 0")
-
-        if not blocking and timeout != -1:
-            raise RuntimeError("Can't set timeout with non-blocking")
+        self._validate_acquire_args(blocking, timeout)
 
         try:
             result = self._try_acquire(name=name, weight=weight, timeout=timeout, blocking=blocking)
@@ -417,14 +456,18 @@ class Limiter:
         if not isawaitable(result):
             return result
 
-        async def _resolve_result(async_result: Awaitable[bool]) -> bool:
-            try:
-                return await self._handle_async_result(async_result)
-            except TimeoutError:
-                logger.debug("Acquisition TimeoutError")
-                return False
+        return self._await_acquire(result)
 
-        return _resolve_result(result)
+    async def _await_acquire(self, result: Awaitable[bool]) -> bool:
+        """Resolve an awaitable acquire result, converting TimeoutError to
+        False - the public acquire contract: timeouts are reported as False,
+        never raised. Shared by ``try_acquire``'s async tail and
+        ``try_acquire_async``."""
+        try:
+            return await self._handle_async_result(result)
+        except TimeoutError:
+            logger.debug("Acquisition TimeoutError")
+            return False
 
     async def _acquire_async(self, blocking, name, weight, timeout=-1):
         return await self._handle_async_result(self._try_acquire(name, weight, blocking=blocking, timeout=timeout, _force_async=True))
@@ -459,11 +502,7 @@ class Limiter:
         if weight == 0:
             return True
 
-        if timeout < 0 and timeout != -1:
-            raise ValueError("timeout must be -1 or >= 0")
-
-        if not blocking and timeout != -1:
-            raise RuntimeError("Can't set timeout with non-blocking")
+        self._validate_acquire_args(blocking, timeout)
 
         async def run():
             lock = self._get_async_lock()
@@ -526,7 +565,7 @@ class Limiter:
                     result = await result
                     continue
 
-                remaining = deadline - monotonic()
+                remaining = (deadline - self._now_ms()) / 1000
                 if remaining <= 0:
                     timed_out = True
                     _cancel_if_pending(result)
@@ -577,7 +616,7 @@ class Limiter:
         Return true on success, false on failure
         """
 
-        deadline: Optional[float] = monotonic() + timeout if timeout != -1 else None
+        deadline: Optional[float] = self._now_ms() + timeout * 1000 if timeout != -1 else None
 
         with combined_lock(self.lock, blocking=blocking, timeout=timeout):
             assert weight >= 0, "item's weight must be >= 0"

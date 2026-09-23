@@ -23,24 +23,22 @@ def _limiter(rates=None, buffer_ms=0):
 
 def test_plan_delay_step_outcomes():
     """The deadline math shared by both _delay_waiter branches."""
-    from time import monotonic
-
     from pyrate_limiter.limiter import _plan_delay_step
 
     # No deadline -> sleep the full delay, never time out.
-    assert _plan_delay_step(None, 200) == (0.2, False)
+    assert _plan_delay_step(1000, None, 200) == (0.2, False)
 
     # Deadline far in the future (remaining > delay) -> sleep the delay.
-    secs, timed_out = _plan_delay_step(monotonic() + 10, 200)
+    secs, timed_out = _plan_delay_step(1000, 1000 + 10_000, 200)
     assert abs(secs - 0.2) < 0.02 and timed_out is False
 
     # Deadline near (remaining < delay) -> sleep the remainder, then time out.
-    secs, timed_out = _plan_delay_step(monotonic() + 0.05, 200)
+    secs, timed_out = _plan_delay_step(1000, 1000 + 50, 200)
     assert 0 < secs <= 0.07 and timed_out is True
 
     # Deadline already passed -> raise immediately (no sleep).
     with pytest.raises(TimeoutError):
-        _plan_delay_step(monotonic() - 1, 200)
+        _plan_delay_step(1000, 999, 200)
 
 
 # ------------------------------------------------- waiting() boundary (Bug X)
