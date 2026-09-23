@@ -27,6 +27,9 @@ class AbstractBucket(ABC):
     _rates: List[Rate]
     failing_rate: Optional[Rate] = None
     _clock: AbstractClock = MonotonicClock()
+    # Last reading handed out by now(); instance-level once first read. Backs
+    # the monotonic guard in now() (see there).
+    _last_now: Optional[int] = None
     # Default policy; every built-in bucket takes an ``algorithm=`` argument.
     _algorithm: LogAlgorithm = SlidingWindowLog()
     # (weight, absolute timestamp at which that weight fits), from the last
@@ -62,8 +65,39 @@ class AbstractBucket(ABC):
         self._rates = ordered
 
     def now(self):
-        """Retrieve current timestamp from the clock backend."""
-        return self._clock.now()
+        """Retrieve current timestamp from the clock backend.
+
+        Single clock-read boundary for every bucket: all timestamping
+        (SingleBucketFactory.wrap_item, the Leaker, state buckets) funnels
+        through here, so the monotonicity policy lives in exactly one place.
+
+        Backwards policy: a clock regression is clamped to the last reading
+        handed out - time, as seen by the bucket, never goes backwards. A
+        regressed read is therefore equivalent to "no time has passed", which
+        keeps window math and item ordering consistent instead of corrupting
+        sorted in-memory state. Forward reads are passed through untouched.
+        """
+        reading = self._clock.now()
+
+        if isawaitable(reading):
+
+            async def _await_reading() -> int:
+                return self._clamp_now(await reading)
+
+            return _await_reading()
+
+        return self._clamp_now(reading)
+
+    def _clamp_now(self, reading: int) -> int:
+        """Apply the no-backwards policy to one clock reading."""
+        last = self._last_now
+
+        if last is not None and reading < last:
+            logger.debug("Clock regression of %dms clamped to last reading %d", last - reading, last)
+            return last
+
+        self._last_now = reading
+        return reading
 
     def _record(self, item: RateItem, decision: Decision) -> bool:
         """Store a put()'s verdict; return whether it was admitted.

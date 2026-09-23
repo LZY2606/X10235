@@ -62,6 +62,45 @@ class MonotonicAsyncClock(AbstractClock):
         return self._get_monotonic_ms()
 
 
+class VirtualClock(AbstractClock):
+    """Manually advanced monotonic clock, meant for testing only.
+
+    ``now()`` returns the current virtual reading and never goes backwards:
+    this is the same monotonicity contract ``MonotonicClock`` gives the
+    production paths, so a limiter exercised against a ``VirtualClock`` runs
+    the exact same clock-read code (``AbstractBucket.now``) as in production -
+    only the time source is swapped. Time does not pass on its own; tests move
+    it explicitly with :meth:`advance`, which makes boundary, cancellation and
+    ordering cases deterministic without real sleeps.
+
+    Backwards policy: consistent with the bucket-level guard - a regression
+    request is rejected, never silently accepted. ``advance`` with a negative
+    delta and ``set`` with an earlier reading both raise ``ValueError``.
+    """
+
+    def __init__(self, start_ms: int = 0):
+        assert start_ms >= 0, "VirtualClock must start at a non-negative reading"
+        self._reading = int(start_ms)
+
+    def now(self) -> int:
+        """Get the current virtual time in milliseconds"""
+        return self._reading
+
+    def advance(self, delta_ms: int) -> int:
+        """Move the clock forward by ``delta_ms``; returns the new reading."""
+        if delta_ms < 0:
+            raise ValueError(f"VirtualClock is monotonic: cannot advance by {delta_ms}ms")
+        self._reading += int(delta_ms)
+        return self._reading
+
+    def set(self, reading_ms: int) -> int:
+        """Move the clock to an absolute reading; rejects going backwards."""
+        if reading_ms < self._reading:
+            raise ValueError(f"VirtualClock is monotonic: cannot set {reading_ms}ms < {self._reading}ms")
+        self._reading = int(reading_ms)
+        return self._reading
+
+
 class PostgresClock(AbstractClock):
     """Get timestamp using Postgres as remote clock backend"""
 
