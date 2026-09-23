@@ -9,8 +9,51 @@ from typing import Tuple
 
 from .conftest import logger
 from pyrate_limiter import AbstractBucket
+from pyrate_limiter import AbstractClock
 from pyrate_limiter import Limiter
 from pyrate_limiter import RateItem
+
+
+class VirtualClock:
+    """Deterministic monotonic virtual clock for tests.
+
+    Exposes the SAME virtual timeline in milliseconds (bucket view, via
+    ``VirtualMonotonicClock``) and in seconds (``Limiter`` deadline view,
+    via ``now_s``), so a bucket and its limiter can never disagree about
+    "now". Tests drive time explicitly with ``advance``/``regress``.
+    """
+
+    def __init__(self, start_ms: int = 1_000_000):
+        self._ms = start_ms
+
+    def now_ms(self) -> int:
+        return self._ms
+
+    def now_s(self) -> float:
+        return self._ms / 1000
+
+    def advance(self, ms: int) -> None:
+        assert ms >= 0, "advance() only moves time forward"
+        self._ms += ms
+
+    def regress(self, ms: int) -> None:
+        assert ms >= 0, "regress() only moves time backward"
+        self._ms -= ms
+
+
+class VirtualMonotonicClock(AbstractClock):
+    """AbstractClock adapter exposing a VirtualClock to a bucket.
+
+    Injected through the public ``InMemoryBucket(rates, clock=...)`` entry
+    point; it shares no code path with production clocks beyond the
+    ``AbstractClock.now()`` interface itself.
+    """
+
+    def __init__(self, clock: VirtualClock):
+        self._clock = clock
+
+    def now(self) -> int:
+        return self._clock.now_ms()
 
 
 async def inspect_bucket_items(bucket: AbstractBucket, expected_item_count: int):

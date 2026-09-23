@@ -105,7 +105,21 @@ def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeo
                 lock.release()
 
 
-def _plan_delay_step(deadline: Optional[float], delay_ms: Union[int, float]) -> Tuple[float, bool]:
+def _check_deadline(deadline: Optional[float], now: Callable[[], float]) -> None:
+    """Raise ``TimeoutError`` (without sleeping) when ``deadline`` has passed.
+
+    Shared by both ``_delay_waiter`` branches so the sync and async loops
+    apply the exact same deadline check against the exact same clock.
+    """
+    if deadline is not None and deadline - now() <= 0:
+        raise TimeoutError()
+
+
+def _plan_delay_step(
+    deadline: Optional[float],
+    delay_ms: Union[int, float],
+    now: Callable[[], float] = monotonic,
+) -> Tuple[float, bool]:
     """Plan one delay step for `_delay_waiter`.
 
     Returns ``(seconds_to_sleep, raise_timeout_after_sleep)``. Raises
@@ -113,10 +127,11 @@ def _plan_delay_step(deadline: Optional[float], delay_ms: Union[int, float]) -> 
     passed. This is the deadline math shared verbatim by the sync and async
     branches of `_delay_waiter`; the caller performs the actual sleep with its
     own primitive (`time.sleep` vs `asyncio.sleep`) and re-raises afterwards.
+    ``now`` is the limiter's (possibly virtual) monotonic clock.
     """
     if deadline is None:
         return delay_ms / 1000, False
-    remaining_ms = (deadline - monotonic()) * 1000
+    remaining_ms = (deadline - now()) * 1000
     if remaining_ms <= 0:
         raise TimeoutError()
     if remaining_ms < delay_ms:
@@ -132,6 +147,10 @@ class Limiter:
     bucket_factory: BucketFactory
     lock: Union[RLock, Iterable]
     buffer_ms: int
+    # Monotonic-seconds source for deadline/timeout math (default
+    # ``time.monotonic``); ``_now`` is its regression-clamping wrapper.
+    clock: Callable[[], float]
+    _now: Callable[[], float]
 
     # async_lock is thread local, created on first use
     _thread_local: local
@@ -140,15 +159,24 @@ class Limiter:
         self,
         argument: Union[BucketFactory, AbstractBucket, Rate, List[Rate]],
         buffer_ms: int = 50,
+        clock: Optional[Callable[[], float]] = None,
     ):
         """Init Limiter using either a single bucket / multiple-bucket factory
         / single rate / rate list.
 
         Parameters:
             argument (Union[BucketFactory, AbstractBucket, Rate, List[Rate]]): The bucket or rate configuration.
+            buffer_ms (int): Extra milliseconds added to every computed wait.
+            clock (Optional[Callable[[], float]]): Monotonic time source in
+                seconds (like ``time.monotonic``) used for timeout/deadline
+                math. Defaults to ``time.monotonic``. Injectable so tests can
+                drive deadline behaviour with a virtual clock; production
+                behaviour is unchanged.
         """
 
         self.buffer_ms = buffer_ms
+        self.clock = clock if clock is not None else monotonic
+        self._now = self._monotonic_guard(self.clock)
         self.bucket_factory = self._init_bucket_factory(argument)
         self.lock = RLock()
         self._thread_local = local()
@@ -157,6 +185,39 @@ class Limiter:
             limiter_lock = argument.limiter_lock()
             if limiter_lock is not None:
                 self.lock = (limiter_lock, self.lock)
+
+    @staticmethod
+    def _monotonic_guard(source: Callable[[], float]) -> Callable[[], float]:
+        """Wrap a monotonic-seconds source so it never reads backwards.
+
+        This is the limiter's single clock-regression policy: a backwards
+        read is clamped to the last value seen, so a regressed clock can
+        stall a deadline but never extend it. It is a no-op for genuinely
+        monotonic sources (``time.monotonic``), so normal input behaviour
+        does not drift.
+        """
+        last = float("-inf")
+
+        def guarded() -> float:
+            nonlocal last
+            now = source()
+            if now > last:
+                last = now
+            return last
+
+        return guarded
+
+    @staticmethod
+    def _validate_acquire_args(blocking: bool, timeout: Union[int, float]) -> None:
+        """Argument validation shared verbatim by ``try_acquire`` and
+        ``try_acquire_async`` so both public entries reject bad input with
+        the same exception types.
+        """
+        if timeout < 0 and timeout != -1:
+            raise ValueError("timeout must be -1 or >= 0")
+
+        if not blocking and timeout != -1:
+            raise RuntimeError("Can't set timeout with non-blocking")
 
     def buckets(self) -> List[AbstractBucket]:
         """Get list of active buckets"""
@@ -220,10 +281,7 @@ class Limiter:
 
             async def _handle_async(delay):
                 while True:
-                    if deadline is not None:
-                        remaining_ms = (deadline - monotonic()) * 1000
-                        if remaining_ms <= 0:
-                            raise TimeoutError()
+                    _check_deadline(deadline, self._now)
 
                     d = await self._handle_async_result(delay, deadline=deadline) if isawaitable(delay) else delay
                     assert isinstance(d, int)
@@ -232,7 +290,7 @@ class Limiter:
                         return False
                     d = sleep_ms
 
-                    secs, timed_out = _plan_delay_step(deadline, d)
+                    secs, timed_out = _plan_delay_step(deadline, d, self._now)
                     await asyncio.sleep(secs)
                     if timed_out:
                         raise TimeoutError()
@@ -258,7 +316,7 @@ class Limiter:
                 delay = sleep_ms
                 total_delay += delay
 
-                secs, timed_out = _plan_delay_step(deadline, delay)
+                secs, timed_out = _plan_delay_step(deadline, delay, self._now)
                 sleep(secs)
                 if timed_out:
                     raise TimeoutError()
@@ -339,13 +397,13 @@ class Limiter:
             if sleep_ms is None:
                 return False
 
-            secs, timed_out = _plan_delay_step(deadline, sleep_ms)
+            secs, timed_out = _plan_delay_step(deadline, sleep_ms, self._now)
             sleep(secs)  # lock intentionally NOT held during the sleep
             if timed_out:
                 raise TimeoutError()
 
             item.timestamp += sleep_ms
-            remaining: Union[int, float] = -1 if deadline is None else max(0.0, deadline - monotonic())
+            remaining: Union[int, float] = -1 if deadline is None else max(0.0, deadline - self._now())
 
             with combined_lock(self.lock, blocking=True, timeout=remaining):
                 re_acquire = bucket.put(item)
@@ -380,6 +438,38 @@ class Limiter:
         self._thread_local.async_lock_loop = loop
         return lock
 
+    def _run_acquire(self, **kwargs) -> Union[bool, Awaitable[bool]]:
+        """Call ``_try_acquire``, converting ``TimeoutError`` to ``False``.
+
+        This is the single sync-side exception-conversion boundary: every
+        public entry (``try_acquire``, the sync decorator) funnels through
+        it so the TimeoutError -> False wait semantics cannot drift.
+        """
+        try:
+            return self._try_acquire(**kwargs)
+        except TimeoutError:
+            logger.debug("Acquisition TimeoutError")
+            return False
+
+    @staticmethod
+    async def _await_or_false(awaitable: Awaitable[bool]) -> bool:
+        """Await an acquire, converting any timeout to ``False``.
+
+        The single async-side exception-conversion boundary, shared by
+        ``try_acquire`` (awaitable results) and ``try_acquire_async``.
+        ``asyncio.TimeoutError`` is listed explicitly for Python 3.10,
+        where it is not yet an alias of ``TimeoutError``.
+        """
+        try:
+            return await awaitable
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.debug("Acquisition TimeoutError")
+            return False
+
+    def _resolve_acquire(self, result: Awaitable[bool]) -> Awaitable[bool]:
+        """Normalize an awaitable acquire result to a timeout-safe coroutine."""
+        return self._await_or_false(self._handle_async_result(result))
+
     def try_acquire(self, name: str = "pyrate", weight: int = 1, blocking: bool = True, timeout: int | float = -1) -> Union[bool, Awaitable[bool]]:
         """
         Attempt to acquire a permit from the limiter.
@@ -402,29 +492,14 @@ class Limiter:
             True if the permit was acquired, False otherwise. Async limiters
             return an awaitable resolving to the same.
         """
-        if timeout < 0 and timeout != -1:
-            raise ValueError("timeout must be -1 or >= 0")
+        self._validate_acquire_args(blocking, timeout)
 
-        if not blocking and timeout != -1:
-            raise RuntimeError("Can't set timeout with non-blocking")
-
-        try:
-            result = self._try_acquire(name=name, weight=weight, timeout=timeout, blocking=blocking)
-        except TimeoutError:
-            logger.debug("Acquisition TimeoutError")
-            return False
+        result = self._run_acquire(name=name, weight=weight, timeout=timeout, blocking=blocking)
 
         if not isawaitable(result):
             return result
 
-        async def _resolve_result(async_result: Awaitable[bool]) -> bool:
-            try:
-                return await self._handle_async_result(async_result)
-            except TimeoutError:
-                logger.debug("Acquisition TimeoutError")
-                return False
-
-        return _resolve_result(result)
+        return self._resolve_acquire(result)
 
     async def _acquire_async(self, blocking, name, weight, timeout=-1):
         return await self._handle_async_result(self._try_acquire(name, weight, blocking=blocking, timeout=timeout, _force_async=True))
@@ -459,11 +534,7 @@ class Limiter:
         if weight == 0:
             return True
 
-        if timeout < 0 and timeout != -1:
-            raise ValueError("timeout must be -1 or >= 0")
-
-        if not blocking and timeout != -1:
-            raise RuntimeError("Can't set timeout with non-blocking")
+        self._validate_acquire_args(blocking, timeout)
 
         async def run():
             lock = self._get_async_lock()
@@ -474,13 +545,10 @@ class Limiter:
                 # the acquire can even run.
                 return await self._acquire_async(blocking=blocking, name=name, weight=weight, timeout=timeout)
 
-        try:
-            if timeout > 0:
-                # wait_for additionally bounds time spent waiting on the async lock.
-                return await asyncio.wait_for(run(), timeout=timeout)
-            return await run()
-        except (asyncio.TimeoutError, TimeoutError):
-            return False
+        if timeout > 0:
+            # wait_for additionally bounds time spent waiting on the async lock.
+            return await self._await_or_false(asyncio.wait_for(run(), timeout=timeout))
+        return await self._await_or_false(run())
 
     async def _acquire_co(
         self,
@@ -526,7 +594,7 @@ class Limiter:
                     result = await result
                     continue
 
-                remaining = deadline - monotonic()
+                remaining = deadline - self._now()
                 if remaining <= 0:
                     timed_out = True
                     _cancel_if_pending(result)
@@ -577,7 +645,7 @@ class Limiter:
         Return true on success, false on failure
         """
 
-        deadline: Optional[float] = monotonic() + timeout if timeout != -1 else None
+        deadline: Optional[float] = self._now() + timeout if timeout != -1 else None
 
         with combined_lock(self.lock, blocking=blocking, timeout=timeout):
             assert weight >= 0, "item's weight must be >= 0"
@@ -667,10 +735,7 @@ class Limiter:
 
                 @wraps(func)
                 def wrapper(*args, **kwargs):
-                    try:
-                        r = self._try_acquire(name=name, weight=weight, blocking=True, _allow_async_result=False)
-                    except TimeoutError:
-                        r = False
+                    r = self._run_acquire(name=name, weight=weight, blocking=True, _allow_async_result=False)
                     if isawaitable(r):
                         try:
                             self._cleanup_awaitable(r)
@@ -696,6 +761,8 @@ class Limiter:
         state = self.__dict__.copy()
         state.pop("lock", None)
         state.pop("_thread_local", None)
+        # The clamping wrapper is a closure; rebuilt from `clock` on unpickle.
+        state.pop("_now", None)
         return state
 
     def __setstate__(self, state):
@@ -703,3 +770,4 @@ class Limiter:
         self.__dict__.update(state)
         self.lock = RLock()
         self._thread_local = local()
+        self._now = self._monotonic_guard(self.clock)
