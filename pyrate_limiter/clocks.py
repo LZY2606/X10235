@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Awaitable, Union
 
 if TYPE_CHECKING:
     from psycopg_pool import ConnectionPool
+    from ._time import VirtualTimeService as VirtualTimeServiceLike
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,24 @@ class MonotonicAsyncClock(AbstractClock):
     async def now(self) -> int:
         """Get monotonic time in milliseconds"""
         return self._get_monotonic_ms()
+
+
+class VirtualClock(AbstractClock):
+    """Deterministic monotonic clock, meant for testing only.
+
+    Time never advances on its own; the test driver moves it through the bound
+    time source (``pyrate_limiter._time.VirtualTimeService``), so the bucket's
+    item timestamps and the Limiter's deadline/sleep math stay on the same
+    clock. Backward moves raise ``ClockMovedBackwardError`` rather than being
+    silently accepted.
+    """
+
+    def __init__(self, time_source: "VirtualTimeServiceLike"):
+        self._time_source = time_source
+
+    def now(self) -> int:
+        """Get current virtual time in milliseconds."""
+        return self._time_source.now_ms()
 
 
 class PostgresClock(AbstractClock):
