@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from time import monotonic_ns, time_ns
@@ -60,6 +61,64 @@ class MonotonicAsyncClock(AbstractClock):
     async def now(self) -> int:
         """Get monotonic time in milliseconds"""
         return self._get_monotonic_ms()
+
+
+class VirtualClock(AbstractClock):
+    """Manually advanced monotonic clock, meant for testing only.
+
+    Time moves only when the test says so, which makes limiter/bucket timing
+    behavior deterministic: inject the same instance into a ``Limiter`` (its
+    deadline/wait scheduling) and into a bucket (``bucket._clock``) and drive
+    both with ``advance()``.
+
+    Backwards policy (consistent, by construction): ``now()`` never goes
+    backwards. ``set()`` to an earlier timestamp is a clamped no-op (logged),
+    and ``advance()`` with a negative delta is rejected with ``ValueError``.
+
+    Wait seam: ``sleep_ms``/``asleep_ms`` are the test hooks ``Limiter``
+    delegates to when its clock defines them, instead of really sleeping.
+    They advance virtual time by the requested wait, so a blocking acquire
+    completes without real waiting while exercising the exact production
+    delay loop. ``MonotonicClock`` defines no such methods, so production
+    keeps sleeping in real time - the seam only reroutes *how long* the
+    limiter waits, never *whether* it waits.
+    """
+
+    def __init__(self, start_ms: int = 0):
+        self._now_ms = start_ms
+
+    def now(self) -> int:
+        return self._now_ms
+
+    def set(self, timestamp_ms: int) -> int:
+        """Move to an absolute timestamp; refuses to go backwards."""
+        if timestamp_ms < self._now_ms:
+            logger.warning(
+                "VirtualClock: ignoring backwards set(%d) at %d; monotonic clock never goes backwards",
+                timestamp_ms,
+                self._now_ms,
+            )
+            return self._now_ms
+
+        self._now_ms = timestamp_ms
+        return self._now_ms
+
+    def advance(self, delta_ms: int) -> int:
+        """Move forward by ``delta_ms``; negative deltas are unsupported."""
+        if delta_ms < 0:
+            raise ValueError(f"VirtualClock cannot advance backwards: {delta_ms}")
+
+        self._now_ms += delta_ms
+        return self._now_ms
+
+    def sleep_ms(self, delay_ms: int) -> None:
+        """Sync wait seam: a virtual sleep is exactly an advance of the wait."""
+        self.advance(delay_ms)
+
+    async def asleep_ms(self, delay_ms: int) -> None:
+        """Async wait seam: advance, then yield so peers can observe the wait."""
+        self.advance(delay_ms)
+        await asyncio.sleep(0)
 
 
 class PostgresClock(AbstractClock):
