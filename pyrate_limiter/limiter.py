@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable, Iterable, List, Optional, Protocol,
 
 from .abstracts import AbstractBucket, BucketFactory, Rate, RateItem
 from .buckets import InMemoryBucket
+from .clocks import AbstractClock, SystemMonotonicClock
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,12 @@ DecoratorWrapper = Callable[[Callable[[Any], Any]], Callable[[Any], Any]]
 
 # Sentinel: "no bucket obtained yet" for _acquire_co (None is a valid arg).
 _UNSET: Any = object()
+
+# Every public acquire entry converts these into a plain ``False`` result
+# instead of leaking an exception. Shared by the sync and async boundaries so
+# their exception conversion can never drift (on 3.11+ the two names are
+# aliases; on 3.10 they are distinct).
+_TIMEOUT_EXCEPTIONS = (TimeoutError, asyncio.TimeoutError)
 
 
 class LockLike(Protocol):
@@ -72,7 +79,13 @@ class SingleBucketFactory(BucketFactory):
 
 
 @contextmanager
-def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeout: int | float = -1):
+def combined_lock(
+    locks: Union[Iterable[LockLike], RLock],
+    blocking: bool,
+    timeout: int | float = -1,
+    now: Optional[Callable[[], float]] = None,
+):
+    current_now = now or monotonic
     if not isinstance(locks, Iterable):
         acquired_ok = locks.acquire(blocking=blocking, timeout=timeout)
         if not acquired_ok:
@@ -84,7 +97,7 @@ def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeo
 
     else:
         acquired_locks = []
-        deadline = monotonic() + timeout if blocking and timeout != -1 else None
+        deadline = current_now() + timeout if blocking and timeout != -1 else None
         try:
             for lock in locks:
                 if not blocking:
@@ -93,7 +106,7 @@ def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeo
                     ok = lock.acquire()
                 else:
                     assert deadline is not None
-                    remaining = max(0.0, deadline - monotonic())
+                    remaining = max(0.0, deadline - current_now())
                     ok = lock.acquire(timeout=remaining)
 
                 if not ok:
@@ -105,7 +118,11 @@ def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeo
                 lock.release()
 
 
-def _plan_delay_step(deadline: Optional[float], delay_ms: Union[int, float]) -> Tuple[float, bool]:
+def _plan_delay_step(
+    deadline: Optional[float],
+    delay_ms: Union[int, float],
+    now: Optional[Callable[[], float]] = None,
+) -> Tuple[float, bool]:
     """Plan one delay step for `_delay_waiter`.
 
     Returns ``(seconds_to_sleep, raise_timeout_after_sleep)``. Raises
@@ -113,10 +130,16 @@ def _plan_delay_step(deadline: Optional[float], delay_ms: Union[int, float]) -> 
     passed. This is the deadline math shared verbatim by the sync and async
     branches of `_delay_waiter`; the caller performs the actual sleep with its
     own primitive (`time.sleep` vs `asyncio.sleep`) and re-raises afterwards.
+
+    ``now`` is the single clock read of this step. It defaults to the process
+    monotonic clock; an injected clock (e.g. ``VirtualClock``) drives both
+    branches identically, which is how sync and async stay equivalent under
+    virtual time.
     """
+    current = monotonic() if now is None else now()
     if deadline is None:
         return delay_ms / 1000, False
-    remaining_ms = (deadline - monotonic()) * 1000
+    remaining_ms = (deadline - current) * 1000
     if remaining_ms <= 0:
         raise TimeoutError()
     if remaining_ms < delay_ms:
@@ -140,16 +163,26 @@ class Limiter:
         self,
         argument: Union[BucketFactory, AbstractBucket, Rate, List[Rate]],
         buffer_ms: int = 50,
+        clock: Optional[AbstractClock] = None,
     ):
         """Init Limiter using either a single bucket / multiple-bucket factory
         / single rate / rate list.
 
         Parameters:
             argument (Union[BucketFactory, AbstractBucket, Rate, List[Rate]]): The bucket or rate configuration.
+            clock (AbstractClock): Monotonic time source shared by item
+                timestamps and deadline/delay planning. Defaults to a fresh
+                process monotonic clock per limiter (limiters never share
+                clocks). A virtual monotonic clock may be injected for
+                deterministic tests; this is the one boundary the sync and
+                async paths read time through.
         """
 
         self.buffer_ms = buffer_ms
-        self.bucket_factory = self._init_bucket_factory(argument)
+        self._clock = clock if clock is not None else SystemMonotonicClock()
+        # Only an explicitly injected clock is pushed into the bucket: buckets
+        # with their own clock (Postgres, SQLite, Redis wall-clock) keep it.
+        self.bucket_factory = self._init_bucket_factory(argument, clock)
         self.lock = RLock()
         self._thread_local = local()
 
@@ -168,9 +201,30 @@ class Limiter:
         """
         return self.bucket_factory.dispose(bucket)
 
+    def _now(self) -> float:
+        """The single clock read shared by the sync and async acquire paths.
+
+        Deadline planning, remaining-time math and the clock half of item
+        timestamps all go through here, so injecting a virtual clock controls
+        every read and the two paths cannot observe different "nows".
+        """
+        return self._clock.now_seconds()
+
+    def _deadline_remaining(self, deadline: Optional[float]) -> Optional[float]:
+        """Seconds left until ``deadline``; ``None`` when there is no
+        deadline. Never negative (a passed deadline reads as 0).
+        """
+        if deadline is None:
+            return None
+        return max(0.0, deadline - self._now())
+
+    def _deadline_passed(self, deadline: Optional[float]) -> bool:
+        return deadline is not None and deadline - self._now() <= 0
+
     def _init_bucket_factory(
         self,
         argument: Union[BucketFactory, AbstractBucket, Rate, List[Rate]],
+        clock: Optional[AbstractClock] = None,
     ) -> BucketFactory:
         if isinstance(argument, Rate):
             argument = [argument]
@@ -180,9 +234,11 @@ class Limiter:
             assert isinstance(argument[0], Rate), "Not valid rates list"
             rates = argument
             logger.info("Initializing default bucket(InMemoryBucket) with rates: %s", rates)
-            argument = InMemoryBucket(rates)
+            argument = InMemoryBucket(rates, clock=clock)
 
         if isinstance(argument, AbstractBucket):
+            if clock is not None:
+                argument._clock = clock
             argument = SingleBucketFactory(argument)
 
         assert isinstance(argument, BucketFactory), "Not a valid bucket/bucket-factory"
@@ -220,10 +276,8 @@ class Limiter:
 
             async def _handle_async(delay):
                 while True:
-                    if deadline is not None:
-                        remaining_ms = (deadline - monotonic()) * 1000
-                        if remaining_ms <= 0:
-                            raise TimeoutError()
+                    if self._deadline_passed(deadline):
+                        raise TimeoutError()
 
                     d = await self._handle_async_result(delay, deadline=deadline) if isawaitable(delay) else delay
                     assert isinstance(d, int)
@@ -232,7 +286,7 @@ class Limiter:
                         return False
                     d = sleep_ms
 
-                    secs, timed_out = _plan_delay_step(deadline, d)
+                    secs, timed_out = _plan_delay_step(deadline, d, now=self._now)
                     await asyncio.sleep(secs)
                     if timed_out:
                         raise TimeoutError()
@@ -258,7 +312,7 @@ class Limiter:
                 delay = sleep_ms
                 total_delay += delay
 
-                secs, timed_out = _plan_delay_step(deadline, delay)
+                secs, timed_out = _plan_delay_step(deadline, delay, now=self._now)
                 sleep(secs)
                 if timed_out:
                     raise TimeoutError()
@@ -339,15 +393,16 @@ class Limiter:
             if sleep_ms is None:
                 return False
 
-            secs, timed_out = _plan_delay_step(deadline, sleep_ms)
+            secs, timed_out = _plan_delay_step(deadline, sleep_ms, now=self._now)
             sleep(secs)  # lock intentionally NOT held during the sleep
             if timed_out:
                 raise TimeoutError()
 
             item.timestamp += sleep_ms
-            remaining: Union[int, float] = -1 if deadline is None else max(0.0, deadline - monotonic())
+            rem = self._deadline_remaining(deadline)
+            remaining: Union[int, float] = -1 if rem is None else rem
 
-            with combined_lock(self.lock, blocking=True, timeout=remaining):
+            with combined_lock(self.lock, blocking=True, timeout=remaining, now=self._now):
                 re_acquire = bucket.put(item)
 
                 if isawaitable(re_acquire):
@@ -410,7 +465,7 @@ class Limiter:
 
         try:
             result = self._try_acquire(name=name, weight=weight, timeout=timeout, blocking=blocking)
-        except TimeoutError:
+        except _TIMEOUT_EXCEPTIONS:
             logger.debug("Acquisition TimeoutError")
             return False
 
@@ -420,7 +475,7 @@ class Limiter:
         async def _resolve_result(async_result: Awaitable[bool]) -> bool:
             try:
                 return await self._handle_async_result(async_result)
-            except TimeoutError:
+            except _TIMEOUT_EXCEPTIONS:
                 logger.debug("Acquisition TimeoutError")
                 return False
 
@@ -479,7 +534,7 @@ class Limiter:
                 # wait_for additionally bounds time spent waiting on the async lock.
                 return await asyncio.wait_for(run(), timeout=timeout)
             return await run()
-        except (asyncio.TimeoutError, TimeoutError):
+        except _TIMEOUT_EXCEPTIONS:
             return False
 
     async def _acquire_co(
@@ -526,7 +581,8 @@ class Limiter:
                     result = await result
                     continue
 
-                remaining = deadline - monotonic()
+                remaining = self._deadline_remaining(deadline)
+                assert remaining is not None
                 if remaining <= 0:
                     timed_out = True
                     _cancel_if_pending(result)
@@ -577,9 +633,9 @@ class Limiter:
         Return true on success, false on failure
         """
 
-        deadline: Optional[float] = monotonic() + timeout if timeout != -1 else None
+        deadline: Optional[float] = self._now() + timeout if timeout != -1 else None
 
-        with combined_lock(self.lock, blocking=blocking, timeout=timeout):
+        with combined_lock(self.lock, blocking=blocking, timeout=timeout, now=self._now):
             assert weight >= 0, "item's weight must be >= 0"
 
             if weight == 0:
@@ -669,7 +725,7 @@ class Limiter:
                 def wrapper(*args, **kwargs):
                     try:
                         r = self._try_acquire(name=name, weight=weight, blocking=True, _allow_async_result=False)
-                    except TimeoutError:
+                    except _TIMEOUT_EXCEPTIONS:
                         r = False
                     if isawaitable(r):
                         try:

@@ -28,8 +28,11 @@ from .buckets import SQLiteBucket as SQLiteBucket
 from .buckets import SQLiteClock as SQLiteClock
 from .buckets import SQLiteQueries as SQLiteQueries
 from .clocks import AbstractClock as AbstractClock
+from .clocks import AsyncVirtualClock as AsyncVirtualClock
 from .clocks import MonotonicAsyncClock as MonotonicAsyncClock
 from .clocks import MonotonicClock as MonotonicClock
+from .clocks import SystemMonotonicClock as SystemMonotonicClock
+from .clocks import VirtualClock as VirtualClock
 from .clocks import WallClock as WallClock
 from .clocks import PostgresClock as PostgresClock
 from .limiter import Limiter as Limiter
@@ -69,8 +72,11 @@ __all__ = [
     "SQLiteClock",
     "SQLiteQueries",
     "AbstractClock",
+    "AsyncVirtualClock",
     "MonotonicAsyncClock",
     "MonotonicClock",
+    "SystemMonotonicClock",
+    "VirtualClock",
     "WallClock",
     "PostgresClock",
     "Limiter",

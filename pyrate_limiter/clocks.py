@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from time import monotonic_ns, time_ns
+from time import monotonic, monotonic_ns, time_ns
 from typing import TYPE_CHECKING, Awaitable, Union
 
 if TYPE_CHECKING:
@@ -19,6 +19,17 @@ class AbstractClock(ABC):
     @abstractmethod
     def now(self) -> Union[int, Awaitable[int]]:
         """Get time as of now, in milliseconds"""
+
+    def now_seconds(self) -> float:
+        """Get current time in seconds, on the same scale as ``now()``.
+
+        This is the single seam through which a ``Limiter`` reads time for
+        deadline planning, while the bucket's ``now()`` stamps items in
+        milliseconds; deriving seconds from ``now()`` keeps both on one
+        injected time source instead of reaching for a second system clock.
+        Millisecond-only custom clocks get this for free.
+        """
+        return self.now() / 1000  # type: ignore[operator]
 
     @staticmethod
     def _get_monotonic_ms() -> int:
@@ -35,11 +46,80 @@ class AbstractClock(ABC):
         """
         return time_ns() // 1_000_000
 
+    @staticmethod
+    def _get_monotonic_seconds() -> float:
+        """Get monotonic time in seconds (``time.monotonic``)."""
+        return monotonic()
+
 
 class MonotonicClock(AbstractClock):
     def now(self) -> int:
         """Get monotonic time in milliseconds"""
         return self._get_monotonic_ms()
+
+
+class SystemMonotonicClock(MonotonicClock):
+    """Process-local monotonic clock in both milliseconds (``now``) and
+    seconds (``now_seconds``).
+
+    Seconds come straight from ``time.monotonic`` rather than a truncated
+    millisecond value, keeping sub-millisecond deadline precision, while both
+    methods share one underlying monotonic source. Every ``Limiter`` gets a
+    fresh instance by default - limiters must not share clock state.
+    """
+
+    def now_seconds(self) -> float:
+        return self._get_monotonic_seconds()
+
+
+class VirtualClock(MonotonicClock):
+    """Deterministic, strictly non-decreasing monotonic clock for tests.
+
+    Time starts at ``start_ms`` and only moves forward through ``advance``;
+    ``now()`` never observes wall-clock time. Backward movement is refused
+    with ``ValueError`` rather than silently clamped - the consistent
+    clock-regression policy shared by every caller.
+
+    ``Limiter(..., clock=...)`` and ``InMemoryBucket(..., clock=...)`` accept
+    it, so item timestamps, deadline planning and delay steps all run on the
+    one injected time source.
+
+    Note: blocking waits still sleep in real time (``time.sleep`` /
+    ``asyncio.sleep``); a frozen clock only lets a deadline expire once the
+    test advances it. Use non-blocking acquires or advance the clock from
+    another task/thread when exercising timeout paths deterministically.
+    """
+
+    def __init__(self, start_ms: int = 0):
+        self._now_ms = int(start_ms)
+
+    def now(self) -> int:
+        """Current virtual time, in milliseconds"""
+        return self._now_ms
+
+    def now_seconds(self) -> float:
+        return self._now_ms / 1000
+
+    def advance(self, milliseconds: int) -> int:
+        """Move the clock forward; return the new millisecond time.
+
+        Backward movement raises ``ValueError`` and leaves the clock
+        untouched, so callers cannot corrupt monotonicity by accident.
+        """
+        if milliseconds < 0:
+            msg = f"VirtualClock cannot move backwards: {milliseconds} ms"
+            raise ValueError(msg)
+
+        self._now_ms += int(milliseconds)
+        return self._now_ms
+
+
+class AsyncVirtualClock(VirtualClock):
+    """:class:`VirtualClock` with an awaitable ``now()`` (async buckets)."""
+
+    async def now(self) -> int:  # type: ignore[override]
+        """Get virtual time as of now, in milliseconds"""
+        return self._now_ms
 
 
 class WallClock(AbstractClock):
