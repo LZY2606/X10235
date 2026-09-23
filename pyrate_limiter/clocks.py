@@ -62,6 +62,35 @@ class MonotonicAsyncClock(AbstractClock):
         return self._get_monotonic_ms()
 
 
+class VirtualClock(AbstractClock):
+    """Manually-advanced monotonic clock, meant for testing only.
+
+    ``now()`` never moves on its own; tests drive it deterministically with
+    ``advance()`` instead of sleeping, so window-boundary behaviour can be
+    pinned exactly. The clock enforces the same monotonicity policy the
+    bucket algorithms rely on: moving it backwards is rejected explicitly
+    with ``ValueError`` rather than silently corrupting window math.
+    """
+
+    def __init__(self, start_ms: int = 0):
+        self._now = start_ms
+
+    def now(self) -> int:
+        """Current virtual time, in milliseconds"""
+        return self._now
+
+    def advance(self, delta_ms: int) -> int:
+        """Move the clock forward by ``delta_ms``; returns the new time.
+
+        Raises ``ValueError`` on a negative delta - a monotonic clock does
+        not go backwards.
+        """
+        if delta_ms < 0:
+            raise ValueError("VirtualClock is monotonic: cannot advance by a negative delta")
+        self._now += delta_ms
+        return self._now
+
+
 class PostgresClock(AbstractClock):
     """Get timestamp using Postgres as remote clock backend"""
 

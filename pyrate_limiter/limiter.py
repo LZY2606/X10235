@@ -189,6 +189,43 @@ class Limiter:
 
         return argument
 
+    @staticmethod
+    def _validate_acquire_args(timeout: Union[int, float], blocking: bool) -> None:
+        """Argument validation shared by ``try_acquire`` / ``try_acquire_async``.
+
+        Single source for the public error contract: ``ValueError`` on a
+        negative timeout other than -1, ``RuntimeError`` when a timeout is
+        combined with non-blocking. Previously duplicated verbatim in both
+        entry points.
+        """
+        if timeout < 0 and timeout != -1:
+            raise ValueError("timeout must be -1 or >= 0")
+
+        if not blocking and timeout != -1:
+            raise RuntimeError("Can't set timeout with non-blocking")
+
+    def _acquire_or_false(self, **kwargs) -> Union[bool, Awaitable[bool]]:
+        """Sync half of the shared TimeoutError -> False conversion.
+
+        Used by ``try_acquire`` and the sync decorator so the exception
+        contract (TimeoutError becomes a ``False`` result, nothing else is
+        swallowed) lives in exactly one place.
+        """
+        try:
+            return self._try_acquire(**kwargs)
+        except TimeoutError:
+            logger.debug("Acquisition TimeoutError")
+            return False
+
+    async def _resolve_or_false(self, result: Awaitable[bool]) -> bool:
+        """Async half of the shared TimeoutError -> False conversion:
+        resolve a (possibly nested) awaitable acquire result."""
+        try:
+            return await self._handle_async_result(result)
+        except TimeoutError:
+            logger.debug("Acquisition TimeoutError")
+            return False
+
     def _delay_to_sleep_ms(self, delay: int) -> Optional[int]:
         """Translate a ``bucket.waiting()`` result into milliseconds to sleep
         before re-attempting the put.
@@ -402,32 +439,23 @@ class Limiter:
             True if the permit was acquired, False otherwise. Async limiters
             return an awaitable resolving to the same.
         """
-        if timeout < 0 and timeout != -1:
-            raise ValueError("timeout must be -1 or >= 0")
+        self._validate_acquire_args(timeout, blocking)
 
-        if not blocking and timeout != -1:
-            raise RuntimeError("Can't set timeout with non-blocking")
-
-        try:
-            result = self._try_acquire(name=name, weight=weight, timeout=timeout, blocking=blocking)
-        except TimeoutError:
-            logger.debug("Acquisition TimeoutError")
-            return False
+        result = self._acquire_or_false(name=name, weight=weight, timeout=timeout, blocking=blocking)
 
         if not isawaitable(result):
             return result
 
-        async def _resolve_result(async_result: Awaitable[bool]) -> bool:
-            try:
-                return await self._handle_async_result(async_result)
-            except TimeoutError:
-                logger.debug("Acquisition TimeoutError")
-                return False
-
-        return _resolve_result(result)
+        return self._resolve_or_false(result)
 
     async def _acquire_async(self, blocking, name, weight, timeout=-1):
-        return await self._handle_async_result(self._try_acquire(name, weight, blocking=blocking, timeout=timeout, _force_async=True))
+        try:
+            result = self._try_acquire(name, weight, blocking=blocking, timeout=timeout, _force_async=True)
+        except TimeoutError:
+            logger.debug("Acquisition TimeoutError")
+            return False
+
+        return await self._resolve_or_false(result)
 
     async def try_acquire_async(self, name: str = "pyrate", weight: int = 1, blocking: bool = True, timeout: int | float = -1) -> bool:
         """
@@ -459,11 +487,7 @@ class Limiter:
         if weight == 0:
             return True
 
-        if timeout < 0 and timeout != -1:
-            raise ValueError("timeout must be -1 or >= 0")
-
-        if not blocking and timeout != -1:
-            raise RuntimeError("Can't set timeout with non-blocking")
+        self._validate_acquire_args(timeout, blocking)
 
         async def run():
             lock = self._get_async_lock()
@@ -667,10 +691,7 @@ class Limiter:
 
                 @wraps(func)
                 def wrapper(*args, **kwargs):
-                    try:
-                        r = self._try_acquire(name=name, weight=weight, blocking=True, _allow_async_result=False)
-                    except TimeoutError:
-                        r = False
+                    r = self._acquire_or_false(name=name, weight=weight, blocking=True, _allow_async_result=False)
                     if isawaitable(r):
                         try:
                             self._cleanup_awaitable(r)
