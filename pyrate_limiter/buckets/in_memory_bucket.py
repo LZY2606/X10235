@@ -8,6 +8,7 @@ from typing import List, Optional
 from ..abstracts.algorithm import ADMITTED, Decision, LogAlgorithm
 from ..abstracts.bucket import AbstractBucket
 from ..abstracts.rate import Rate, RateItem
+from ..clocks import AbstractClock
 
 # Items are kept sorted by timestamp ascending; key for bisect lookups.
 _by_timestamp = attrgetter("timestamp")
@@ -26,8 +27,8 @@ class InMemoryBucket(AbstractBucket):
     failing_rate: Optional[Rate]
     is_async = False
 
-    def __init__(self, rates: List[Rate], algorithm: Optional[LogAlgorithm] = None):
-        super().__init__()
+    def __init__(self, rates: List[Rate], algorithm: Optional[LogAlgorithm] = None, clock: Optional[AbstractClock] = None):
+        super().__init__(clock=clock)
 
         if algorithm is not None:
             self._algorithm = algorithm

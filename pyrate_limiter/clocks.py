@@ -62,6 +62,42 @@ class MonotonicAsyncClock(AbstractClock):
         return self._get_monotonic_ms()
 
 
+class VirtualClock(AbstractClock):
+    """Manually-driven monotonic clock, meant for testing.
+
+    It plugs into the exact production clock-reading boundary
+    (``AbstractBucket.now()`` -> ``clock.now()``), so a bucket driven by a
+    ``VirtualClock`` executes the same code path as one driven by
+    ``MonotonicClock`` - only the time source differs.
+
+    Backwards policy: time travel is allowed via ``set()``/``advance()`` with
+    a negative delta (simulating e.g. an NTP rollback), but ``now()`` NEVER
+    returns less than the largest value it has already emitted - the reading
+    is clamped to that high-water mark. Buckets therefore always observe
+    non-decreasing timestamps, which is the single consistent strategy every
+    window algorithm in this package relies on.
+    """
+
+    def __init__(self, start_ms: int = 0):
+        self._current = start_ms
+        self._emitted = start_ms
+
+    def now(self) -> int:
+        """Current virtual time, clamped to the high-water mark."""
+        if self._current > self._emitted:
+            self._emitted = self._current
+        return self._emitted
+
+    def set(self, timestamp_ms: int) -> None:
+        """Move the clock to an absolute timestamp (forwards or backwards)."""
+        self._current = timestamp_ms
+
+    def advance(self, delta_ms: int) -> int:
+        """Move the clock by a signed delta; returns the next ``now()``."""
+        self._current += delta_ms
+        return self.now()
+
+
 class PostgresClock(AbstractClock):
     """Get timestamp using Postgres as remote clock backend"""
 

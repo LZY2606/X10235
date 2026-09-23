@@ -39,6 +39,14 @@ class AbstractBucket(ABC):
     # it may wrap either a sync or an async client (issue #305).
     is_async: Optional[bool] = None
 
+    def __init__(self, clock: Optional[AbstractClock] = None) -> None:
+        # Instance-level clock injection. Without it, ``_clock`` stays the
+        # shared (stateless) class default; with it, only THIS bucket sees the
+        # injected clock, so two limiters can never leak clocks into each
+        # other through the class attribute.
+        if clock is not None:
+            self._clock = clock
+
     @property
     def rates(self) -> List[Rate]:
         return self._rates
