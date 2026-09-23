@@ -1,6 +1,6 @@
 """Naive bucket implementation using built-in list"""
 
-from bisect import bisect_left
+from bisect import bisect_left, insort_right
 from operator import attrgetter
 from threading import RLock
 from typing import List, Optional
@@ -8,6 +8,7 @@ from typing import List, Optional
 from ..abstracts.algorithm import ADMITTED, Decision, LogAlgorithm
 from ..abstracts.bucket import AbstractBucket
 from ..abstracts.rate import Rate, RateItem
+from ..clocks import AbstractClock
 
 # Items are kept sorted by timestamp ascending; key for bisect lookups.
 _by_timestamp = attrgetter("timestamp")
@@ -26,11 +27,22 @@ class InMemoryBucket(AbstractBucket):
     failing_rate: Optional[Rate]
     is_async = False
 
-    def __init__(self, rates: List[Rate], algorithm: Optional[LogAlgorithm] = None):
+    def __init__(
+        self,
+        rates: List[Rate],
+        algorithm: Optional[LogAlgorithm] = None,
+        clock: Optional[AbstractClock] = None,
+    ):
         super().__init__()
 
         if algorithm is not None:
             self._algorithm = algorithm
+
+        if clock is not None:
+            # Test seam, mirroring StateBucket(clock=...): an injected clock is
+            # read through the same AbstractBucket.now() path the production
+            # MonotonicClock default uses - no parallel time source.
+            self._clock = clock
 
         self.rates = rates  # AbstractBucket.rates setter sorts + validates
         self.items = []
@@ -71,10 +83,12 @@ class InMemoryBucket(AbstractBucket):
 
             self._record(item, ADMITTED)
 
-            if item.weight > 1:
-                self.items.extend([item for _ in range(item.weight)])
-            else:
-                self.items.append(item)
+            # insort (not append) keeps `items` sorted by timestamp even when
+            # the clock moved backwards between puts - the invariant every
+            # bisect above relies on. With a non-decreasing clock this lands
+            # at the tail, exactly where append() used to put it.
+            for _ in range(item.weight):
+                insort_right(self.items, item, key=_by_timestamp)
 
             return True
 

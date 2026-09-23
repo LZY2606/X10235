@@ -20,6 +20,12 @@ DecoratorWrapper = Callable[[Callable[[Any], Any]], Callable[[Any], Any]]
 # Sentinel: "no bucket obtained yet" for _acquire_co (None is a valid arg).
 _UNSET: Any = object()
 
+# Timeout flavours every acquire path maps to a ``False`` result.
+# ``asyncio.TimeoutError`` is ``TimeoutError`` on Python 3.11+, but a distinct
+# class on 3.10 - listing both keeps the conversion identical across versions
+# and across the sync/async entry points.
+_TIMEOUT_ERRORS = (asyncio.TimeoutError, TimeoutError)
+
 
 class LockLike(Protocol):
     def acquire(self, blocking: bool = ..., timeout: Union[float, int, None] = ...) -> bool: ...
@@ -188,6 +194,19 @@ class Limiter:
         assert isinstance(argument, BucketFactory), "Not a valid bucket/bucket-factory"
 
         return argument
+
+    @staticmethod
+    def _validate_acquire_args(blocking: bool, timeout: Union[int, float]) -> None:
+        """Argument contract shared by ``try_acquire`` and ``try_acquire_async``.
+
+        Both public entry points must reject the same inputs with the same
+        exception types, so the checks live in exactly one place.
+        """
+        if timeout < 0 and timeout != -1:
+            raise ValueError("timeout must be -1 or >= 0")
+
+        if not blocking and timeout != -1:
+            raise RuntimeError("Can't set timeout with non-blocking")
 
     def _delay_to_sleep_ms(self, delay: int) -> Optional[int]:
         """Translate a ``bucket.waiting()`` result into milliseconds to sleep
@@ -402,15 +421,11 @@ class Limiter:
             True if the permit was acquired, False otherwise. Async limiters
             return an awaitable resolving to the same.
         """
-        if timeout < 0 and timeout != -1:
-            raise ValueError("timeout must be -1 or >= 0")
-
-        if not blocking and timeout != -1:
-            raise RuntimeError("Can't set timeout with non-blocking")
+        self._validate_acquire_args(blocking, timeout)
 
         try:
             result = self._try_acquire(name=name, weight=weight, timeout=timeout, blocking=blocking)
-        except TimeoutError:
+        except _TIMEOUT_ERRORS:
             logger.debug("Acquisition TimeoutError")
             return False
 
@@ -420,7 +435,7 @@ class Limiter:
         async def _resolve_result(async_result: Awaitable[bool]) -> bool:
             try:
                 return await self._handle_async_result(async_result)
-            except TimeoutError:
+            except _TIMEOUT_ERRORS:
                 logger.debug("Acquisition TimeoutError")
                 return False
 
@@ -459,11 +474,7 @@ class Limiter:
         if weight == 0:
             return True
 
-        if timeout < 0 and timeout != -1:
-            raise ValueError("timeout must be -1 or >= 0")
-
-        if not blocking and timeout != -1:
-            raise RuntimeError("Can't set timeout with non-blocking")
+        self._validate_acquire_args(blocking, timeout)
 
         async def run():
             lock = self._get_async_lock()
@@ -479,7 +490,7 @@ class Limiter:
                 # wait_for additionally bounds time spent waiting on the async lock.
                 return await asyncio.wait_for(run(), timeout=timeout)
             return await run()
-        except (asyncio.TimeoutError, TimeoutError):
+        except _TIMEOUT_ERRORS:
             return False
 
     async def _acquire_co(
