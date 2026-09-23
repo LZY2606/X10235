@@ -8,6 +8,7 @@ from typing import List, Optional
 from ..abstracts.algorithm import ADMITTED, Decision, LogAlgorithm
 from ..abstracts.bucket import AbstractBucket
 from ..abstracts.rate import Rate, RateItem
+from ..clocks import AbstractClock, MonotonicClock
 
 # Items are kept sorted by timestamp ascending; key for bisect lookups.
 _by_timestamp = attrgetter("timestamp")
@@ -26,8 +27,19 @@ class InMemoryBucket(AbstractBucket):
     failing_rate: Optional[Rate]
     is_async = False
 
-    def __init__(self, rates: List[Rate], algorithm: Optional[LogAlgorithm] = None):
+    def __init__(
+        self,
+        rates: List[Rate],
+        algorithm: Optional[LogAlgorithm] = None,
+        clock: Optional[AbstractClock] = None,
+    ):
         super().__init__()
+
+        # Instance-level clock (instead of the shared class default) so two
+        # limiters/buckets can never observe each other's time state - a
+        # VirtualMonotonicClock injected into one bucket is not visible to
+        # another bucket merely sharing the class attribute.
+        self._clock = clock or MonotonicClock()
 
         if algorithm is not None:
             self._algorithm = algorithm
