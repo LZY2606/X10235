@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from threading import Event, RLock
 from abc import ABC, abstractmethod
 from time import monotonic_ns, time_ns
-from typing import TYPE_CHECKING, Awaitable, Union
+from typing import TYPE_CHECKING, Awaitable, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from psycopg_pool import ConnectionPool
@@ -60,6 +62,128 @@ class MonotonicAsyncClock(AbstractClock):
     async def now(self) -> int:
         """Get monotonic time in milliseconds"""
         return self._get_monotonic_ms()
+
+
+class VirtualClock(AbstractClock):
+    """Deterministic monotonic clock for tests.
+
+    Time is virtual milliseconds; it moves only through ``advance()`` or
+    through sleeps registered against this clock (sync ``Event`` waits from
+    worker threads, async futures from the event loop). ``now()`` can never go
+    backwards by itself, so the same clock instance can stamp bucket items and
+    drive a Limiter's deadlines/waits with zero real delay - the sync and
+    async acquire paths then run their production logic unchanged.
+
+    This is part of the public test surface; the Limiter recognises the
+    ``virtual_time`` marker (see ``Limiter``) and routes all its time reads and
+    sleeps through this clock.
+    """
+
+    #: Marker the Limiter looks for when choosing its time boundary.
+    virtual_time: bool = True
+
+    def __init__(self, start_ms: int = 0):
+        if not isinstance(start_ms, int):
+            msg = "VirtualClock start_ms must be an int"
+            raise TypeError(msg)
+
+        self._now_ms = start_ms
+        # Sync blocking waits run in worker threads while a test thread drives
+        # advance(); every mutation is therefore guarded.
+        self._lock = RLock()
+        self._sync_waits: List[Tuple[int, Event]] = []
+        self._async_waits: List[Tuple[int, "asyncio.AbstractEventLoop", "asyncio.Future"]] = []
+
+    def now(self) -> int:
+        """Current virtual time, in milliseconds."""
+        with self._lock:
+            return self._now_ms
+
+    def advance(self, ms: int) -> int:
+        """Move time forward by ``ms`` milliseconds (>= 0), waking every sleep
+        registered at or before the new time. Returns the new time.
+
+        Going backwards is refused: a clock that cannot go back is exactly the
+        monotonic guarantee callers rely on.
+        """
+        if not isinstance(ms, int):
+            msg = "VirtualClock.advance() expects an int number of milliseconds"
+            raise TypeError(msg)
+
+        if ms < 0:
+            msg = "VirtualClock cannot move backwards"
+            raise ValueError(msg)
+
+        with self._lock:
+            return self._fire_due(self._now_ms + ms)
+
+    # -------------------------------------------------------------- internal
+
+    def _register_sync(self, wake_ms: int) -> Event:
+        event = Event()
+        with self._lock:
+            self._sync_waits.append((wake_ms, event))
+        return event
+
+    def _unregister_sync(self, event: Event) -> None:
+        with self._lock:
+            self._sync_waits = [entry for entry in self._sync_waits if entry[1] is not event]
+
+    def _register_async(self, wake_ms: int) -> "asyncio.Future":
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        with self._lock:
+            self._async_waits.append((wake_ms, loop, future))
+        return future
+
+    def _unregister_async(self, future: "asyncio.Future") -> None:
+        with self._lock:
+            self._async_waits = [entry for entry in self._async_waits if entry[2] is not future]
+
+    def earliest_wake(self) -> Optional[int]:
+        """Smallest registered wake time, or None when nobody is sleeping."""
+        with self._lock:
+            wakes = [entry[0] for entry in self._sync_waits]
+            wakes.extend(entry[0] for entry in self._async_waits)
+            return min(wakes) if wakes else None
+
+    def drive_to_next_wake(self) -> Optional[int]:
+        """Advance to the earliest registered sleep and wake what is due."""
+        with self._lock:
+            target = self.earliest_wake_locked()
+            if target is None:
+                return None
+            return self._fire_due(target)
+
+    def earliest_wake_locked(self) -> Optional[int]:
+        wakes = [entry[0] for entry in self._sync_waits]
+        wakes.extend(entry[0] for entry in self._async_waits)
+        return min(wakes) if wakes else None
+
+    def _fire_due(self, target_ms: int) -> int:
+        """Commit ``target_ms`` as the new time and release due sleepers.
+
+        Caller must hold ``self._lock``; futures/events are resolved only after
+        releasing it to avoid re-entering it from a woken thread.
+        """
+        if target_ms < self._now_ms:
+            msg = "VirtualClock cannot move backwards"
+            raise ValueError(msg)
+
+        due_sync = [entry for entry in self._sync_waits if entry[0] <= target_ms]
+        due_async = [entry for entry in self._async_waits if entry[0] <= target_ms]
+        self._sync_waits = [entry for entry in self._sync_waits if entry[0] > target_ms]
+        self._async_waits = [entry for entry in self._async_waits if entry[0] > target_ms]
+        self._now_ms = target_ms
+
+        for _, event in due_sync:
+            event.set()
+
+        for _, loop, future in due_async:
+            if not future.done():
+                loop.call_soon_threadsafe(future.set_result, None)
+
+        return self._now_ms
 
 
 class PostgresClock(AbstractClock):
