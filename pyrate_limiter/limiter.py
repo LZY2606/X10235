@@ -6,11 +6,12 @@ from contextlib import contextmanager
 from functools import wraps
 from inspect import isawaitable, iscoroutine, iscoroutinefunction
 from threading import RLock, local
-from time import monotonic, sleep
+from time import monotonic, monotonic_ns, sleep
 from typing import Any, Awaitable, Callable, Iterable, List, Optional, Protocol, Tuple, Union
 
 from .abstracts import AbstractBucket, BucketFactory, Rate, RateItem
 from .buckets import InMemoryBucket
+from .clocks import AbstractClock, MonotonicClock, StableMonotonicClock
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,58 @@ DecoratorWrapper = Callable[[Callable[[Any], Any]], Callable[[Any], Any]]
 
 # Sentinel: "no bucket obtained yet" for _acquire_co (None is a valid arg).
 _UNSET: Any = object()
+
+
+class _TimeControl:
+    """Single time boundary shared by the sync and async acquire paths.
+
+    Everything an acquire needs from the environment converges here:
+
+    - **clock reading** - ``seconds()``/``millis()`` for deadlines, and the
+      stable ``clock`` view handed to buckets for item timestamps. Both read
+      the SAME wrapped clock, so deadlines and bucket time can never diverge.
+    - **delay waiting** - ``sleep()`` (sync) and ``asleep()`` (async) run the
+      same millisecond step; a clock providing ``sleep_ms`` (the test-only
+      `VirtualMonotonicClock`) drives both primitives with virtual time, so
+      tests execute the production waiting code instead of a parallel copy.
+
+    Clocks are per-Limiter: two limiters injecting different clocks cannot
+    observe each other's readings. A read is clamped non-decreasing by
+    `StableMonotonicClock`, which is the library's single rollback policy.
+    """
+
+    def __init__(self, clock: Optional[AbstractClock] = None):
+        self.clock: AbstractClock = StableMonotonicClock(clock) if clock is not None else MonotonicClock()
+        self._virtual_sleep = getattr(self.clock, "sleep_ms", None)
+        self._virtual_asleep = getattr(self.clock, "asleep_ms", None)
+
+    def seconds(self) -> float:
+        """Monotonic seconds for deadline arithmetic."""
+        if self._virtual_sleep is None:
+            return monotonic()
+        return self.clock.now() / 1000
+
+    def millis(self) -> int:
+        """Monotonic milliseconds, same reading as a bucket's ``now()``."""
+        if self._virtual_sleep is None:
+            return monotonic_ns() // 1_000_000
+        return self.clock.now()
+
+    def sleep(self, seconds: Union[int, float]) -> None:
+        if seconds <= 0:
+            return
+        if self._virtual_sleep is not None:
+            self._virtual_sleep(seconds * 1000)
+        else:
+            sleep(seconds)
+
+    async def asleep(self, seconds: Union[int, float]) -> None:
+        if seconds <= 0:
+            return
+        if self._virtual_asleep is not None:
+            await self._virtual_asleep(seconds * 1000)
+        else:
+            await asyncio.sleep(seconds)
 
 
 class LockLike(Protocol):
@@ -31,13 +84,26 @@ class SingleBucketFactory(BucketFactory):
 
     bucket: AbstractBucket
 
-    def __init__(self, bucket: AbstractBucket, schedule_leak: bool = True):
+    def __init__(
+        self,
+        bucket: AbstractBucket,
+        schedule_leak: bool = True,
+        clock: Optional[AbstractClock] = None,
+    ):
         """
         Initialize the SingleBucketFactory with a bucket and an optional leak scheduling flag.
 
         schedule_leak (bool): If True, the factory will schedule periodic leaks for the bucket. Default is True. Disable only if you plan to handle leaking manually.
+        clock (Optional[AbstractClock]): When given, the bucket stamps item
+        timestamps from this clock - the same clock the Limiter reads deadlines
+        from, so injected virtual time stays consistent end to end.
         """
         self.bucket = bucket
+
+        if clock is not None:
+            # One bucket clock: wrap_item's `bucket.now()` and any other
+            # timestamp consumer (e.g. the background Leaker) read identically.
+            bucket._clock = clock
 
         if schedule_leak:
             self.schedule_leak(bucket)
@@ -105,18 +171,22 @@ def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeo
                 lock.release()
 
 
-def _plan_delay_step(deadline: Optional[float], delay_ms: Union[int, float]) -> Tuple[float, bool]:
+def _plan_delay_step(
+    deadline: Optional[float], delay_ms: Union[int, float], now: Optional[float] = None
+) -> Tuple[float, bool]:
     """Plan one delay step for `_delay_waiter`.
 
     Returns ``(seconds_to_sleep, raise_timeout_after_sleep)``. Raises
     ``TimeoutError`` immediately (no sleep) when the deadline has already
     passed. This is the deadline math shared verbatim by the sync and async
-    branches of `_delay_waiter`; the caller performs the actual sleep with its
-    own primitive (`time.sleep` vs `asyncio.sleep`) and re-raises afterwards.
+    branches of `_delay_waiter`; the caller performs the actual sleep through
+    `_TimeControl` (real or virtual time) and re-raises afterwards.
     """
+    if now is None:
+        now = monotonic()
     if deadline is None:
         return delay_ms / 1000, False
-    remaining_ms = (deadline - monotonic()) * 1000
+    remaining_ms = (deadline - now) * 1000
     if remaining_ms <= 0:
         raise TimeoutError()
     if remaining_ms < delay_ms:
@@ -140,16 +210,27 @@ class Limiter:
         self,
         argument: Union[BucketFactory, AbstractBucket, Rate, List[Rate]],
         buffer_ms: int = 50,
+        clock: Optional[AbstractClock] = None,
     ):
         """Init Limiter using either a single bucket / multiple-bucket factory
         / single rate / rate list.
 
         Parameters:
             argument (Union[BucketFactory, AbstractBucket, Rate, List[Rate]]): The bucket or rate configuration.
+            clock (Optional[AbstractClock]): Monotonic clock used for BOTH the
+                acquire deadlines and the items stamped into the bucket. When
+                omitted the real monotonic clock is used. Inject a
+                `VirtualMonotonicClock` for deterministic, wall-clock-free
+                tests; every clock read, sleep and re-put then goes through the
+                injected clock. The clock is per-Limiter and is never shared
+                with another Limiter unless the caller passes the same object.
         """
 
         self.buffer_ms = buffer_ms
-        self.bucket_factory = self._init_bucket_factory(argument)
+        if clock is not None and not isinstance(clock, AbstractClock):
+            raise TypeError(f"clock must be an AbstractClock instance, got {type(clock).__name__}")
+        self._time = _TimeControl(clock)
+        self.bucket_factory = self._init_bucket_factory(argument, self._time.clock)
         self.lock = RLock()
         self._thread_local = local()
 
@@ -171,6 +252,7 @@ class Limiter:
     def _init_bucket_factory(
         self,
         argument: Union[BucketFactory, AbstractBucket, Rate, List[Rate]],
+        clock: Optional[AbstractClock] = None,
     ) -> BucketFactory:
         if isinstance(argument, Rate):
             argument = [argument]
@@ -180,10 +262,10 @@ class Limiter:
             assert isinstance(argument[0], Rate), "Not valid rates list"
             rates = argument
             logger.info("Initializing default bucket(InMemoryBucket) with rates: %s", rates)
-            argument = InMemoryBucket(rates)
+            argument = InMemoryBucket(rates, clock=clock)
 
         if isinstance(argument, AbstractBucket):
-            argument = SingleBucketFactory(argument)
+            argument = SingleBucketFactory(argument, clock=clock)
 
         assert isinstance(argument, BucketFactory), "Not a valid bucket/bucket-factory"
 
@@ -205,6 +287,17 @@ class Limiter:
             delay = 0
         return delay + self.buffer_ms
 
+    def _prepare_delay_step(self, deadline: Optional[float], delay_ms: int) -> Tuple[float, bool]:
+        """Translate a bucket-reported delay into one concrete sleep step.
+
+        Shared by every blocking retry loop (``_delay_waiter`` sync & async,
+        ``_blocking_retry_sync``): delay translation, deadline truncation and
+        timeout-after-sleep decision in one place, and the clock reading comes
+        from the single ``_TimeControl`` boundary so injected virtual time
+        governs all variants identically.
+        """
+        return _plan_delay_step(deadline, delay_ms, now=self._time.seconds())
+
     def _delay_waiter(
         self, bucket: AbstractBucket, item: RateItem, blocking: bool, _force_async: bool = False, deadline: Optional[float] = None
     ) -> Union[bool, Awaitable[bool]]:
@@ -220,11 +313,6 @@ class Limiter:
 
             async def _handle_async(delay):
                 while True:
-                    if deadline is not None:
-                        remaining_ms = (deadline - monotonic()) * 1000
-                        if remaining_ms <= 0:
-                            raise TimeoutError()
-
                     d = await self._handle_async_result(delay, deadline=deadline) if isawaitable(delay) else delay
                     assert isinstance(d, int)
                     sleep_ms = self._delay_to_sleep_ms(d)
@@ -232,8 +320,8 @@ class Limiter:
                         return False
                     d = sleep_ms
 
-                    secs, timed_out = _plan_delay_step(deadline, d)
-                    await asyncio.sleep(secs)
+                    secs, timed_out = self._prepare_delay_step(deadline, d)
+                    await self._time.asleep(secs)
                     if timed_out:
                         raise TimeoutError()
 
@@ -258,8 +346,8 @@ class Limiter:
                 delay = sleep_ms
                 total_delay += delay
 
-                secs, timed_out = _plan_delay_step(deadline, delay)
-                sleep(secs)
+                secs, timed_out = self._prepare_delay_step(deadline, delay)
+                self._time.sleep(secs)
                 if timed_out:
                     raise TimeoutError()
 
@@ -339,13 +427,13 @@ class Limiter:
             if sleep_ms is None:
                 return False
 
-            secs, timed_out = _plan_delay_step(deadline, sleep_ms)
-            sleep(secs)  # lock intentionally NOT held during the sleep
+            secs, timed_out = self._prepare_delay_step(deadline, sleep_ms)
+            self._time.sleep(secs)  # lock intentionally NOT held during the sleep
             if timed_out:
                 raise TimeoutError()
 
             item.timestamp += sleep_ms
-            remaining: Union[int, float] = -1 if deadline is None else max(0.0, deadline - monotonic())
+            remaining: Union[int, float] = -1 if deadline is None else max(0.0, deadline - self._time.seconds())
 
             with combined_lock(self.lock, blocking=True, timeout=remaining):
                 re_acquire = bucket.put(item)
@@ -526,15 +614,15 @@ class Limiter:
                     result = await result
                     continue
 
-                remaining = deadline - monotonic()
+                remaining = deadline - self._time.seconds()
                 if remaining <= 0:
                     timed_out = True
                     _cancel_if_pending(result)
                     raise TimeoutError()
 
                 try:
-                    result = await asyncio.wait_for(result, timeout=remaining)
-                except asyncio.TimeoutError as exc:
+                    result = await self._await_until_deadline(result, remaining)
+                except (asyncio.TimeoutError, TimeoutError) as exc:
                     timed_out = True
                     _cancel_if_pending(result)
                     raise TimeoutError() from exc
@@ -546,6 +634,44 @@ class Limiter:
 
             if iscoroutine(result):
                 result.close()
+
+    async def _await_until_deadline(self, awaitable: Any, remaining_seconds: float):
+        """Await ``awaitable`` bounded by ``remaining_seconds`` on THIS limiter's
+        clock.
+
+        With a virtual clock the bound is enforced virtually: racing a virtual
+        sleeper (registered on the same clock the bucket stamps from) means a
+        test can drive a deadline expiry purely with ``clock.advance()`` and no
+        real wall time elapses. With the real clock this is ``asyncio.wait_for``
+        verbatim, so production behavior and the virtual variant share one
+        call site instead of two timeout implementations.
+        """
+        if getattr(self._time.clock, "asleep_ms", None) is None:
+            return await asyncio.wait_for(awaitable, timeout=remaining_seconds)
+
+        loop = asyncio.get_running_loop()
+        done_future = loop.create_future()
+
+        async def _watch():
+            await self._time.asleep(remaining_seconds)
+            if not done_future.done():
+                done_future.set_result(None)
+
+        watcher = asyncio.ensure_future(_watch())
+
+        try:
+            awaitable_task = asyncio.ensure_future(awaitable) if not asyncio.isfuture(awaitable) else awaitable
+            await asyncio.wait({done_future, awaitable_task}, return_when=asyncio.FIRST_COMPLETED)
+
+            if not awaitable_task.done():
+                awaitable_task.cancel()
+                raise asyncio.TimeoutError()
+
+            return awaitable_task.result()
+        finally:
+            watcher.cancel()
+            if not done_future.done():
+                done_future.cancel()
 
     def _cleanup_awaitable(self, awaitable: Any) -> None:
         if asyncio.isfuture(awaitable):
