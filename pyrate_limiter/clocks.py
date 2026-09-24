@@ -62,6 +62,55 @@ class MonotonicAsyncClock(AbstractClock):
         return self._get_monotonic_ms()
 
 
+class VirtualClock(AbstractClock):
+    """Deterministic monotonic virtual clock, meant for testing only.
+
+    Time only moves when a test calls :meth:`advance` (or constructs a larger
+    value through :meth:`set`); nothing observes the real machine clock. The
+    same instance can drive both a bucket (``bucket.now()`` -> :meth:`now`)
+    and the Limiter's waiting deadlines/sleeps (via a time service bound to
+    it), so sync and async paths can be tested against one shared, injectable
+    time boundary without real sleeps.
+
+    Consistent clock-rollback policy: an attempt to move the clock backwards
+    never rewrites history - readings are clamped to the last observed value
+    (``last >= current`` semantics, matching ``time.monotonic()``). Both
+    :meth:`now` and its async form apply the same shared boundary.
+    """
+
+    def __init__(self, start_ms: int = 0):
+        self._now_ms = int(start_ms)
+
+    def now(self) -> int:
+        """Current virtual time, in milliseconds."""
+        return self._now_ms
+
+    async def now_async(self) -> int:
+        """Async form of :meth:`now`; same reading, no suspension."""
+        return self._now_ms
+
+    def advance(self, delta_ms: int) -> int:
+        """Move time forward by ``delta_ms`` (must be >= 0) and return the new time."""
+        if delta_ms < 0:
+            raise ValueError("VirtualClock.advance() delta must be >= 0; use set() to replay time")
+        self._now_ms += int(delta_ms)
+        return self._now_ms
+
+    def set(self, value_ms: int) -> int:
+        """Assign the next reading; values in the past are clamped forward.
+
+        This is the single place the clock-rollback policy lives, so every
+        writer (tests replaying scenarios, the time service driving sleeps)
+        gets identical behaviour.
+        """
+        self._now_ms = max(self._now_ms, int(value_ms))
+        return self._now_ms
+
+    def seconds(self) -> float:
+        """Current virtual time, in seconds (the Limiter deadline scale)."""
+        return self._now_ms / 1000
+
+
 class PostgresClock(AbstractClock):
     """Get timestamp using Postgres as remote clock backend"""
 
