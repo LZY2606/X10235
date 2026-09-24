@@ -1,5 +1,10 @@
 """Tests for aiohttp_limiter close() method"""
 import pytest
+
+# aiohttp is an optional extra; skip the whole module when it is not
+# installed instead of failing collection for every test run.
+aiohttp = pytest.importorskip("aiohttp")
+
 from pyrate_limiter import Limiter, Rate
 from pyrate_limiter.extras.aiohttp_limiter import RateLimitedSession
 from .conftest import DEFAULT_RATES

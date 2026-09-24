@@ -65,6 +65,25 @@ class AbstractBucket(ABC):
         """Retrieve current timestamp from the clock backend."""
         return self._clock.now()
 
+    @property
+    def clock(self) -> AbstractClock:
+        """The clock this bucket reads ``now()`` from.
+
+        Public injection seam: assigning a controllable clock (e.g.
+        ``MonotonicVirtualClock``) drives every acquire path deterministically,
+        because the limiter only ever reads time through ``bucket.now()`` (via
+        the factory's ``wrap_item()``) and never touches the clock directly.
+        Assignment is per-instance - the class-level default is never mutated,
+        so one limiter's injected clock cannot leak into another's bucket.
+        """
+        return self._clock
+
+    @clock.setter
+    def clock(self, value: AbstractClock) -> None:
+        if not isinstance(value, AbstractClock):
+            raise TypeError(f"clock must be an AbstractClock, got {type(value).__name__}")
+        self._clock = value
+
     def _record(self, item: RateItem, decision: Decision) -> bool:
         """Store a put()'s verdict; return whether it was admitted.
 

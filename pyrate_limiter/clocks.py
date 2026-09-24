@@ -62,6 +62,33 @@ class MonotonicAsyncClock(AbstractClock):
         return self._get_monotonic_ms()
 
 
+class MonotonicVirtualClock(AbstractClock):
+    """Manually advanced monotonic clock, meant for testing only.
+
+    Time moves only when ``advance()`` is called, so window boundaries can be
+    hit exactly without real sleeps. The regression policy is consistent and
+    explicit: ``now()`` is non-decreasing, and a negative ``advance()`` delta
+    is clamped to zero rather than moving the clock backwards - the same
+    "time never runs backwards" policy the limiter applies when it clamps
+    negative waits to 0.
+    """
+
+    def __init__(self, start_ms: int = 0):
+        self._now_ms = start_ms
+
+    def now(self) -> int:
+        """Get the current virtual time in milliseconds"""
+        return self._now_ms
+
+    def advance(self, delta_ms: int) -> int:
+        """Move the clock forward by ``delta_ms``; returns the new time.
+
+        A negative delta is a no-op (clamped), never a step backwards.
+        """
+        self._now_ms += max(0, delta_ms)
+        return self._now_ms
+
+
 class PostgresClock(AbstractClock):
     """Get timestamp using Postgres as remote clock backend"""
 

@@ -21,6 +21,31 @@ DecoratorWrapper = Callable[[Callable[[Any], Any]], Callable[[Any], Any]]
 _UNSET: Any = object()
 
 
+def _deadline_from_timeout(timeout: Union[int, float]) -> Optional[float]:
+    """Translate a public ``timeout`` (seconds, -1 = wait forever) into a
+    monotonic deadline. Single place where any acquire path - sync or async -
+    reads the clock to *set* a deadline.
+    """
+    return None if timeout == -1 else monotonic() + timeout
+
+
+def _remaining_secs(deadline: Optional[float]) -> Optional[float]:
+    """Seconds until ``deadline`` (negative once it has passed), or ``None``
+    when there is no deadline. Single place where any acquire path - sync or
+    async - reads the clock to *check* a deadline.
+    """
+    if deadline is None:
+        return None
+    return deadline - monotonic()
+
+
+def _raise_if_expired(deadline: Optional[float]) -> None:
+    """Raise ``TimeoutError`` (no sleep) when ``deadline`` has already passed."""
+    remaining = _remaining_secs(deadline)
+    if remaining is not None and remaining <= 0:
+        raise TimeoutError()
+
+
 class LockLike(Protocol):
     def acquire(self, blocking: bool = ..., timeout: Union[float, int, None] = ...) -> bool: ...
     def release(self) -> None: ...
@@ -114,9 +139,10 @@ def _plan_delay_step(deadline: Optional[float], delay_ms: Union[int, float]) -> 
     branches of `_delay_waiter`; the caller performs the actual sleep with its
     own primitive (`time.sleep` vs `asyncio.sleep`) and re-raises afterwards.
     """
-    if deadline is None:
+    remaining = _remaining_secs(deadline)
+    if remaining is None:
         return delay_ms / 1000, False
-    remaining_ms = (deadline - monotonic()) * 1000
+    remaining_ms = remaining * 1000
     if remaining_ms <= 0:
         raise TimeoutError()
     if remaining_ms < delay_ms:
@@ -220,10 +246,7 @@ class Limiter:
 
             async def _handle_async(delay):
                 while True:
-                    if deadline is not None:
-                        remaining_ms = (deadline - monotonic()) * 1000
-                        if remaining_ms <= 0:
-                            raise TimeoutError()
+                    _raise_if_expired(deadline)
 
                     d = await self._handle_async_result(delay, deadline=deadline) if isawaitable(delay) else delay
                     assert isinstance(d, int)
@@ -345,7 +368,8 @@ class Limiter:
                 raise TimeoutError()
 
             item.timestamp += sleep_ms
-            remaining: Union[int, float] = -1 if deadline is None else max(0.0, deadline - monotonic())
+            remaining_secs = _remaining_secs(deadline)
+            remaining: Union[int, float] = -1 if remaining_secs is None else max(0.0, remaining_secs)
 
             with combined_lock(self.lock, blocking=True, timeout=remaining):
                 re_acquire = bucket.put(item)
@@ -417,14 +441,23 @@ class Limiter:
         if not isawaitable(result):
             return result
 
-        async def _resolve_result(async_result: Awaitable[bool]) -> bool:
-            try:
-                return await self._handle_async_result(async_result)
-            except TimeoutError:
-                logger.debug("Acquisition TimeoutError")
-                return False
+        return self._resolve_acquire(self._handle_async_result(result))
 
-        return _resolve_result(result)
+    @staticmethod
+    async def _resolve_acquire(result: Awaitable[bool]) -> bool:
+        """Await an acquire outcome, converting any timeout into ``False``.
+
+        The single TimeoutError -> False conversion point for the async side of
+        the public contract, shared by ``try_acquire``'s awaitable branch and
+        ``try_acquire_async`` so both entry points report timeouts identically
+        (``asyncio.TimeoutError`` is ``TimeoutError`` on 3.11+, but both are
+        listed for clarity on older versions).
+        """
+        try:
+            return await result
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.debug("Acquisition TimeoutError")
+            return False
 
     async def _acquire_async(self, blocking, name, weight, timeout=-1):
         return await self._handle_async_result(self._try_acquire(name, weight, blocking=blocking, timeout=timeout, _force_async=True))
@@ -474,13 +507,11 @@ class Limiter:
                 # the acquire can even run.
                 return await self._acquire_async(blocking=blocking, name=name, weight=weight, timeout=timeout)
 
-        try:
-            if timeout > 0:
-                # wait_for additionally bounds time spent waiting on the async lock.
-                return await asyncio.wait_for(run(), timeout=timeout)
-            return await run()
-        except (asyncio.TimeoutError, TimeoutError):
-            return False
+        coro = run()
+        if timeout > 0:
+            # wait_for additionally bounds time spent waiting on the async lock.
+            coro = asyncio.wait_for(coro, timeout=timeout)
+        return await self._resolve_acquire(coro)
 
     async def _acquire_co(
         self,
@@ -526,7 +557,8 @@ class Limiter:
                     result = await result
                     continue
 
-                remaining = deadline - monotonic()
+                remaining = _remaining_secs(deadline)
+                assert remaining is not None
                 if remaining <= 0:
                     timed_out = True
                     _cancel_if_pending(result)
@@ -577,7 +609,7 @@ class Limiter:
         Return true on success, false on failure
         """
 
-        deadline: Optional[float] = monotonic() + timeout if timeout != -1 else None
+        deadline: Optional[float] = _deadline_from_timeout(timeout)
 
         with combined_lock(self.lock, blocking=blocking, timeout=timeout):
             assert weight >= 0, "item's weight must be >= 0"
