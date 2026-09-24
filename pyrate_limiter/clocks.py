@@ -62,6 +62,39 @@ class MonotonicAsyncClock(AbstractClock):
         return self._get_monotonic_ms()
 
 
+class VirtualClock(AbstractClock):
+    """Manually-driven monotonic clock, meant for deterministic tests.
+
+    This is a test-support clock, not a parallel time implementation: buckets
+    and the ``Limiter`` read it through the exact same ``now()`` call they use
+    for ``MonotonicClock`` in production, so every code path under test is the
+    production path - only the time source differs.
+
+    Time only moves when the test says so: ``advance()`` moves it forward,
+    ``jump_to()`` sets an absolute value and may move it backwards to simulate
+    a clock regression. Nothing here auto-advances on read.
+    """
+
+    def __init__(self, start_ms: int = 0):
+        self._now_ms = int(start_ms)
+
+    def now(self) -> int:
+        """Get the current virtual time in milliseconds"""
+        return self._now_ms
+
+    def advance(self, ms: int) -> int:
+        """Move time forward by ``ms`` milliseconds; returns the new time."""
+        if ms < 0:
+            raise ValueError("advance() only moves forward; use jump_to() for an explicit backwards move")
+        self._now_ms += int(ms)
+        return self._now_ms
+
+    def jump_to(self, ms: int) -> int:
+        """Set the absolute virtual time; may move backwards (clock regression)."""
+        self._now_ms = int(ms)
+        return self._now_ms
+
+
 class PostgresClock(AbstractClock):
     """Get timestamp using Postgres as remote clock backend"""
 

@@ -8,6 +8,7 @@ from typing import List, Optional
 from ..abstracts.algorithm import ADMITTED, Decision, LogAlgorithm
 from ..abstracts.bucket import AbstractBucket
 from ..abstracts.rate import Rate, RateItem
+from ..clocks import AbstractClock
 
 # Items are kept sorted by timestamp ascending; key for bisect lookups.
 _by_timestamp = attrgetter("timestamp")
@@ -26,11 +27,17 @@ class InMemoryBucket(AbstractBucket):
     failing_rate: Optional[Rate]
     is_async = False
 
-    def __init__(self, rates: List[Rate], algorithm: Optional[LogAlgorithm] = None):
+    def __init__(self, rates: List[Rate], algorithm: Optional[LogAlgorithm] = None, clock: Optional[AbstractClock] = None):
         super().__init__()
 
         if algorithm is not None:
             self._algorithm = algorithm
+
+        if clock is not None:
+            # Injectable clock (e.g. VirtualClock in tests). Read through the
+            # same AbstractBucket.now() path as the default MonotonicClock, so
+            # no test-only branch exists anywhere in the bucket.
+            self._clock = clock
 
         self.rates = rates  # AbstractBucket.rates setter sorts + validates
         self.items = []
@@ -47,6 +54,13 @@ class InMemoryBucket(AbstractBucket):
                 return self._record(item, ADMITTED)
 
         with self._lock:
+            if self.items and item.timestamp < self.items[-1].timestamp:
+                # Clock-regression policy: a backwards clock never reorders the
+                # log. Clamp to the newest known timestamp so the bisect
+                # invariant (items sorted by timestamp) keeps holding and an
+                # already-elapsed window can never reopen.
+                item.timestamp = self.items[-1].timestamp
+
             # Native inline form of self._algorithm's admit check, so the
             # `after_length < limit` shortcut can skip the bisect entirely
             # rather than materialising a full per-rate counts list.
