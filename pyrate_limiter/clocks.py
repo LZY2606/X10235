@@ -20,10 +20,27 @@ class AbstractClock(ABC):
     def now(self) -> Union[int, Awaitable[int]]:
         """Get time as of now, in milliseconds"""
 
+    def time(self) -> float:
+        """Get time as of now, in seconds.
+
+        Seconds (fractional) is the scale the Limiter uses for deadlines and
+        sleep planning; milliseconds is the scale stamped onto RateItems. A
+        clock implementing ``now()`` gets ``time()`` for free, and - crucially -
+        both views read the SAME underlying source, so an injected virtual clock
+        drives bucket timestamps and limiter deadlines coherently instead of the
+        two drifting on independent clocks.
+        """
+        return self._get_monotonic_seconds()
+
     @staticmethod
     def _get_monotonic_ms() -> int:
         """Get monotonic time in milliseconds"""
         return monotonic_ns() // 1_000_000
+
+    @staticmethod
+    def _get_monotonic_seconds() -> float:
+        """Get monotonic time in (fractional) seconds."""
+        return monotonic_ns() / 1_000_000_000
 
     @staticmethod
     def _get_wall_ms() -> int:
@@ -40,6 +57,11 @@ class MonotonicClock(AbstractClock):
     def now(self) -> int:
         """Get monotonic time in milliseconds"""
         return self._get_monotonic_ms()
+
+    def time(self) -> float:
+        """Monotonic time in seconds; same source (``time.monotonic_ns``) as
+        ``now()``, keeping the ms and s views consistent."""
+        return monotonic_ns() / 1_000_000_000
 
 
 class WallClock(AbstractClock):
@@ -60,6 +82,55 @@ class MonotonicAsyncClock(AbstractClock):
     async def now(self) -> int:
         """Get monotonic time in milliseconds"""
         return self._get_monotonic_ms()
+
+
+class VirtualMonotonicClock(AbstractClock):
+    """Deterministic monotonic clock that moves only when a test advances it.
+
+    Production code reads it through the same boundary as every other clock:
+    ``now()`` for millisecond RateItem timestamps and ``time()`` for the
+    Limiter's second-scale deadlines. Both share one internal counter, so an
+    in-memory bucket constructed with this clock and a Limiter constructed with
+    the same instance observe one coherent virtual timeline.
+
+    Policy on clock movement: the clock is strictly non-decreasing. Attempting
+    to move it backwards is an explicit ``ValueError`` rather than a silent
+    clamp - a backward jump is a test/configuration mistake and swallowing it
+    would hide a broken schedule. This is the repository-wide consistent
+    strategy for clock regression.
+    """
+
+    def __init__(self, start_ms: int = 0):
+        if start_ms < 0:
+            raise ValueError("virtual clock start must be >= 0")
+        self._now_ms = int(start_ms)
+
+    def now(self) -> int:
+        """Current virtual time in milliseconds."""
+        return self._now_ms
+
+    def time(self) -> float:
+        """Current virtual time in seconds; the same counter as ``now()``."""
+        return self._now_ms / 1000
+
+    def advance(self, delta_ms: int) -> int:
+        """Move the clock forward by ``delta_ms`` milliseconds and return the
+        new time. ``delta_ms`` must be non-negative (see class policy)."""
+        if delta_ms < 0:
+            raise ValueError("virtual clock cannot move backwards")
+        self._now_ms += int(delta_ms)
+        return self._now_ms
+
+    def move_to(self, timestamp_ms: int) -> int:
+        """Move the clock to an absolute millisecond timestamp.
+
+        Only forward moves are accepted; moving before the current time raises
+        ``ValueError`` and leaves the clock untouched.
+        """
+        if timestamp_ms < self._now_ms:
+            raise ValueError("virtual clock cannot move backwards")
+        self._now_ms = int(timestamp_ms)
+        return self._now_ms
 
 
 class PostgresClock(AbstractClock):
