@@ -62,6 +62,58 @@ class MonotonicAsyncClock(AbstractClock):
         return self._get_monotonic_ms()
 
 
+class ClockMovedBackward(ValueError):
+    """Raised when a strictly monotonic virtual clock is asked to move back.
+
+    Time moving backwards is never silently accepted: a bucket that compared
+    item timestamps against an earlier ``now`` would resurrect expired windows
+    and grant permits that were already spent. This is the single, explicit
+    policy for every virtual clock - see ``VirtualMonotonicClock.advance``.
+    """
+
+
+class VirtualMonotonicClock(AbstractClock):
+    """Deterministic, strictly monotonic clock for tests and simulations.
+
+    Time is held in an integer millisecond counter and only moves forward via
+    ``advance()``; ``now()`` never consults the real clock, so sync and async
+    limiters driven by the same instance observe exactly the same timeline.
+    Every instance owns its own counter, so separate limiters cannot advance
+    (or otherwise leak) each other's clock.
+
+    Going backwards is rejected with ``ClockMovedBackward`` (a ``ValueError``)
+    rather than clamped: callers that intended a rollback must state it, and
+    stored item timestamps must never be compared against an earlier clock.
+    """
+
+    def __init__(self, start_ms: int = 0):
+        self._now_ms = int(start_ms)
+
+    def now(self) -> int:
+        """Current virtual time, in milliseconds."""
+        return self._now_ms
+
+    def advance(self, milliseconds: int) -> int:
+        """Move the clock forward by ``milliseconds`` (>= 0) and return new time."""
+        if milliseconds < 0:
+            raise ClockMovedBackward(
+                f"Virtual clock cannot move backward by {-milliseconds}ms: now={self._now_ms}"
+            )
+
+        self._now_ms += int(milliseconds)
+        return self._now_ms
+
+    def set(self, milliseconds: int) -> int:
+        """Jump to an absolute timestamp; it must not precede the current one."""
+        if milliseconds < self._now_ms:
+            raise ClockMovedBackward(
+                f"Virtual clock cannot be set to {milliseconds}ms: now={self._now_ms}"
+            )
+
+        self._now_ms = int(milliseconds)
+        return self._now_ms
+
+
 class PostgresClock(AbstractClock):
     """Get timestamp using Postgres as remote clock backend"""
 
