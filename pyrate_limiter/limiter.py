@@ -6,7 +6,9 @@ from contextlib import contextmanager
 from functools import wraps
 from inspect import isawaitable, iscoroutine, iscoroutinefunction
 from threading import RLock, local
-from time import monotonic, sleep
+from time import monotonic
+
+from ._runtime import SYSTEM_CLOCK, TIMEOUT_EXCEPTIONS, plan_delay_step, prepare_wait, timeout_error
 from typing import Any, Awaitable, Callable, Iterable, List, Optional, Protocol, Tuple, Union
 
 from .abstracts import AbstractBucket, BucketFactory, Rate, RateItem
@@ -106,22 +108,13 @@ def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeo
 
 
 def _plan_delay_step(deadline: Optional[float], delay_ms: Union[int, float]) -> Tuple[float, bool]:
-    """Plan one delay step for `_delay_waiter`.
+    """Compatibility wrapper for the shared deadline math in
+    :mod:`pyrate_limiter._runtime` (used by older characterization tests).
 
-    Returns ``(seconds_to_sleep, raise_timeout_after_sleep)``. Raises
-    ``TimeoutError`` immediately (no sleep) when the deadline has already
-    passed. This is the deadline math shared verbatim by the sync and async
-    branches of `_delay_waiter`; the caller performs the actual sleep with its
-    own primitive (`time.sleep` vs `asyncio.sleep`) and re-raises afterwards.
+    Internal callers go through ``Limiter._schedule_wait`` so the limiter's
+    own clock - including injected virtual clocks - supplies ``now()``.
     """
-    if deadline is None:
-        return delay_ms / 1000, False
-    remaining_ms = (deadline - monotonic()) * 1000
-    if remaining_ms <= 0:
-        raise TimeoutError()
-    if remaining_ms < delay_ms:
-        return remaining_ms / 1000, True
-    return delay_ms / 1000, False
+    return plan_delay_step(deadline, delay_ms)
 
 
 class Limiter:
@@ -140,15 +133,26 @@ class Limiter:
         self,
         argument: Union[BucketFactory, AbstractBucket, Rate, List[Rate]],
         buffer_ms: int = 50,
+        *,
+        clock: Any = None,
     ):
         """Init Limiter using either a single bucket / multiple-bucket factory
         / single rate / rate list.
 
         Parameters:
             argument (Union[BucketFactory, AbstractBucket, Rate, List[Rate]]): The bucket or rate configuration.
+
+        Keyword-only ``clock`` is an internal scheduling boundary
+        (``pyrate_limiter._runtime.ScheduleClock`` shape). Production code
+        leaves it unset and gets the system monotonic clock; tests may inject
+        a strictly-monotonic virtual clock. The instance is held per-limiter
+        and never shared behind the caller's back, so multiple limiters cannot
+        leak clocks into one another. The injected object is consumed by the
+        exact same clock-read/sleep/deadline paths as the system clock.
         """
 
         self.buffer_ms = buffer_ms
+        self._clock = clock if clock is not None else SYSTEM_CLOCK
         self.bucket_factory = self._init_bucket_factory(argument)
         self.lock = RLock()
         self._thread_local = local()
@@ -194,16 +198,35 @@ class Limiter:
         before re-attempting the put.
 
         Returns ``None`` when the item can never fit (``waiting() == -1``: the
-        weight exceeds the rate limit). Shared by both branches of
-        ``_delay_waiter`` so the ``-1`` / negative / ``+buffer_ms`` handling is
-        identical - previously the async branch asserted ``d >= 0`` while the
-        sync branch clamped negatives to 0.
+        weight exceeds the rate limit). Thin instance wrapper over the shared
+        :func:`pyrate_limiter._runtime.prepare_wait` boundary, so the
+        ``-1`` / negative / ``+buffer_ms`` handling stays identical across
+        every retry loop (sync and async).
         """
-        if delay == -1:
+        return prepare_wait(delay, self.buffer_ms)
+
+    def _schedule_wait(self, delay_ms: int, deadline: Optional[float]) -> Optional[Tuple[int, float, bool]]:
+        """Resolve one retry step shared by every blocking loop.
+
+        Returns ``(sleep_ms, secs, timed_out)`` or ``None`` when the weight can
+        never fit. Buffer addition, negative/``-1`` normalization and the
+        deadline math are the exact same ``_runtime`` calls for the sync and
+        async callers; callers only choose which clock sleep primitive to use.
+        """
+        sleep_ms = self._delay_to_sleep_ms(delay_ms)
+        if sleep_ms is None:
             return None
-        if delay < 0:
-            delay = 0
-        return delay + self.buffer_ms
+        secs, timed_out = plan_delay_step(deadline, sleep_ms, now_func=self._clock.now)
+        return sleep_ms, secs, timed_out
+
+    @staticmethod
+    def _advance_item(item: RateItem, sleep_ms: int) -> None:
+        """Mutate the retry item's timestamp for the next attempt.
+
+        Single point for the rule every loop applies after sleeping, so sync
+        and async retries can never drift in how the item's clock is moved.
+        """
+        item.timestamp += sleep_ms
 
     def _delay_waiter(
         self, bucket: AbstractBucket, item: RateItem, blocking: bool, _force_async: bool = False, deadline: Optional[float] = None
@@ -220,24 +243,17 @@ class Limiter:
 
             async def _handle_async(delay):
                 while True:
-                    if deadline is not None:
-                        remaining_ms = (deadline - monotonic()) * 1000
-                        if remaining_ms <= 0:
-                            raise TimeoutError()
-
                     d = await self._handle_async_result(delay, deadline=deadline) if isawaitable(delay) else delay
                     assert isinstance(d, int)
-                    sleep_ms = self._delay_to_sleep_ms(d)
-                    if sleep_ms is None:
+                    step = self._schedule_wait(d, deadline)
+                    if step is None:
                         return False
-                    d = sleep_ms
-
-                    secs, timed_out = _plan_delay_step(deadline, d)
-                    await asyncio.sleep(secs)
+                    sleep_ms, secs, timed_out = step
+                    await self._clock.asleep(secs)
                     if timed_out:
-                        raise TimeoutError()
+                        raise timeout_error()
 
-                    item.timestamp += d
+                    self._advance_item(item, sleep_ms)
                     r = bucket.put(item)
                     r = await r if isawaitable(r) else r
                     if r:
@@ -252,18 +268,18 @@ class Limiter:
                 assert not isawaitable(delay)
                 logger.debug("delay=%d, total_delay=%s", delay, total_delay)
 
-                sleep_ms = self._delay_to_sleep_ms(delay)
-                if sleep_ms is None:
+                step = self._schedule_wait(delay, deadline)
+                if step is None:
                     return False
+                sleep_ms, secs, timed_out = step
                 delay = sleep_ms
-                total_delay += delay
+                total_delay += sleep_ms
 
-                secs, timed_out = _plan_delay_step(deadline, delay)
-                sleep(secs)
+                self._clock.sleep(secs)
                 if timed_out:
-                    raise TimeoutError()
+                    raise timeout_error()
 
-                item.timestamp += delay
+                self._advance_item(item, sleep_ms)
                 re_acquire = bucket.put(item)
 
                 if isawaitable(re_acquire):
@@ -335,17 +351,17 @@ class Limiter:
         wait on one key no longer serializes acquisitions for other keys (#301).
         """
         while True:
-            sleep_ms = self._delay_to_sleep_ms(wait_ms)
-            if sleep_ms is None:
+            step = self._schedule_wait(wait_ms, deadline)
+            if step is None:
                 return False
 
-            secs, timed_out = _plan_delay_step(deadline, sleep_ms)
-            sleep(secs)  # lock intentionally NOT held during the sleep
+            sleep_ms, secs, timed_out = step
+            self._clock.sleep(secs)  # lock intentionally NOT held during the sleep
             if timed_out:
-                raise TimeoutError()
+                raise timeout_error()
 
-            item.timestamp += sleep_ms
-            remaining: Union[int, float] = -1 if deadline is None else max(0.0, deadline - monotonic())
+            self._advance_item(item, sleep_ms)
+            remaining: Union[int, float] = -1 if deadline is None else max(0.0, deadline - self._clock.now())
 
             with combined_lock(self.lock, blocking=True, timeout=remaining):
                 re_acquire = bucket.put(item)
