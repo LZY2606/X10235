@@ -1,6 +1,6 @@
 """Naive bucket implementation using built-in list"""
 
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from operator import attrgetter
 from threading import RLock
 from typing import List, Optional
@@ -8,6 +8,7 @@ from typing import List, Optional
 from ..abstracts.algorithm import ADMITTED, Decision, LogAlgorithm
 from ..abstracts.bucket import AbstractBucket
 from ..abstracts.rate import Rate, RateItem
+from ..clocks import AbstractClock
 
 # Items are kept sorted by timestamp ascending; key for bisect lookups.
 _by_timestamp = attrgetter("timestamp")
@@ -26,11 +27,14 @@ class InMemoryBucket(AbstractBucket):
     failing_rate: Optional[Rate]
     is_async = False
 
-    def __init__(self, rates: List[Rate], algorithm: Optional[LogAlgorithm] = None):
+    def __init__(self, rates: List[Rate], algorithm: Optional[LogAlgorithm] = None, clock: Optional[AbstractClock] = None):
         super().__init__()
 
         if algorithm is not None:
             self._algorithm = algorithm
+
+        if clock is not None:
+            self._clock = clock
 
         self.rates = rates  # AbstractBucket.rates setter sorts + validates
         self.items = []
@@ -70,13 +74,27 @@ class InMemoryBucket(AbstractBucket):
                     return self._record(item, self._deny(rate, item, current_length))
 
             self._record(item, ADMITTED)
-
-            if item.weight > 1:
-                self.items.extend([item for _ in range(item.weight)])
-            else:
-                self.items.append(item)
-
+            self._store(item)
             return True
+
+    def _store(self, item: RateItem) -> None:
+        """Append ``item`` (``weight`` copies) keeping ``items`` sorted by
+        timestamp.
+
+        Clock-rewind policy: a clock that ticks backwards (virtual clocks,
+        NTP adjustments) must not corrupt the bisect invariant that
+        ``put``/``leak`` rely on, so out-of-order timestamps are inserted at
+        their sorted position instead of blindly appended. The fast path
+        (non-decreasing timestamps, the common case) stays a plain append.
+        """
+        copies = item.weight if item.weight > 1 else 1
+
+        if not self.items or item.timestamp >= self.items[-1].timestamp:
+            self.items.extend([item] * copies)
+            return
+
+        idx = bisect_right(self.items, item.timestamp, key=_by_timestamp)
+        self.items[idx:idx] = [item] * copies
 
     def _deny(self, rate: Rate, item: RateItem, length: int) -> Decision:
         """Denial verdict, resolving the wait from the items already in hand
