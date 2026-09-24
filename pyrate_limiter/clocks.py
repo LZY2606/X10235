@@ -62,6 +62,39 @@ class MonotonicAsyncClock(AbstractClock):
         return self._get_monotonic_ms()
 
 
+class VirtualClock(AbstractClock):
+    """Manually driven monotonic clock, meant for testing only.
+
+    Timestamps only move forward: ``advance()`` requires a non-negative delta and
+    ``set()`` rejects a value earlier than the current one, so a test can never
+    silently send a bucket's window math backwards in time. Inject it through
+    the public ``AbstractBucket.clock`` property (or a bucket's ``clock=``
+    constructor argument); the bucket reads it through the exact same
+    ``AbstractBucket.now()`` path production clocks use - nothing is mocked.
+    """
+
+    def __init__(self, start_ms: int = 0):
+        self._now = int(start_ms)
+
+    def now(self) -> int:
+        """Current virtual time, in milliseconds"""
+        return self._now
+
+    def advance(self, delta_ms: int) -> int:
+        """Move forward by ``delta_ms``; returns the new time."""
+        if delta_ms < 0:
+            raise ValueError("VirtualClock is monotonic: delta_ms must be >= 0")
+        self._now += int(delta_ms)
+        return self._now
+
+    def set(self, timestamp_ms: int) -> int:
+        """Jump to an absolute time; rejects moving backwards."""
+        if timestamp_ms < self._now:
+            raise ValueError("VirtualClock is monotonic: cannot move backwards")
+        self._now = int(timestamp_ms)
+        return self._now
+
+
 class PostgresClock(AbstractClock):
     """Get timestamp using Postgres as remote clock backend"""
 

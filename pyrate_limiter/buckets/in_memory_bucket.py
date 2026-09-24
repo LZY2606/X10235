@@ -1,6 +1,6 @@
 """Naive bucket implementation using built-in list"""
 
-from bisect import bisect_left
+from bisect import bisect_left, insort
 from operator import attrgetter
 from threading import RLock
 from typing import List, Optional
@@ -8,6 +8,7 @@ from typing import List, Optional
 from ..abstracts.algorithm import ADMITTED, Decision, LogAlgorithm
 from ..abstracts.bucket import AbstractBucket
 from ..abstracts.rate import Rate, RateItem
+from ..clocks import AbstractClock
 
 # Items are kept sorted by timestamp ascending; key for bisect lookups.
 _by_timestamp = attrgetter("timestamp")
@@ -26,11 +27,14 @@ class InMemoryBucket(AbstractBucket):
     failing_rate: Optional[Rate]
     is_async = False
 
-    def __init__(self, rates: List[Rate], algorithm: Optional[LogAlgorithm] = None):
+    def __init__(self, rates: List[Rate], algorithm: Optional[LogAlgorithm] = None, clock: Optional[AbstractClock] = None):
         super().__init__()
 
         if algorithm is not None:
             self._algorithm = algorithm
+
+        if clock is not None:
+            self.clock = clock
 
         self.rates = rates  # AbstractBucket.rates setter sorts + validates
         self.items = []
@@ -71,7 +75,15 @@ class InMemoryBucket(AbstractBucket):
 
             self._record(item, ADMITTED)
 
-            if item.weight > 1:
+            if self.items and item.timestamp < self.items[-1].timestamp:
+                # Clock regression policy: an admitted item whose timestamp is
+                # older than the newest stored one is still stored, but inserted
+                # in sorted position so the bisect lookups in put()/leak() stay
+                # valid. Denials and waits are unaffected (they never mutate
+                # the log), and waits are clamped to >= 0 downstream.
+                for _ in range(item.weight):
+                    insort(self.items, item, key=_by_timestamp)
+            elif item.weight > 1:
                 self.items.extend([item for _ in range(item.weight)])
             else:
                 self.items.append(item)

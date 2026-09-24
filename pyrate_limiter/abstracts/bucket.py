@@ -40,6 +40,22 @@ class AbstractBucket(ABC):
     is_async: Optional[bool] = None
 
     @property
+    def clock(self) -> AbstractClock:
+        """The clock this bucket reads timestamps from.
+
+        Single public injection point for clock backends (production or test):
+        assigning here is instance-local, so one bucket's clock never leaks
+        into another bucket or into the class-level default.
+        """
+        return self._clock
+
+    @clock.setter
+    def clock(self, value: AbstractClock) -> None:
+        if not isinstance(value, AbstractClock):
+            raise TypeError(f"clock must be an AbstractClock, got {type(value).__name__}")
+        self._clock = value
+
+    @property
     def rates(self) -> List[Rate]:
         return self._rates
 
