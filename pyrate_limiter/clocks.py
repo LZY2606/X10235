@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 from abc import ABC, abstractmethod
 from time import monotonic_ns, time_ns
-from typing import TYPE_CHECKING, Awaitable, Union
+from typing import TYPE_CHECKING, Awaitable, Callable, List, Optional, Union
 
 if TYPE_CHECKING:
     from psycopg_pool import ConnectionPool
@@ -60,6 +62,131 @@ class MonotonicAsyncClock(AbstractClock):
     async def now(self) -> int:
         """Get monotonic time in milliseconds"""
         return self._get_monotonic_ms()
+
+
+class VirtualClock(AbstractClock):
+    """Manually controlled monotonic clock for deterministic tests.
+
+    Time is an integer millisecond counter that only moves when a test tells
+    it to (``advance``) or when a limiter driven by this clock waits
+    (``sleep``/``asleep`` move it forward by the waited duration instead of
+    blocking real time). This keeps the bucket's item timestamps and the
+    Limiter's deadline math on one shared timeline, so blocking acquire paths
+    can be exercised instantly and exactly.
+
+    Monotonicity is enforced by default: ``advance`` rejects a negative delta.
+    NTP-style corrections are represented explicitly by ``move_back``; callers
+    that allow them choose the policy at construction (``on_backwards``).
+    ``sleep``/``asleep`` never move time backwards.
+
+    ``history`` records every observation/move in call order; assertions on it
+    pin the first-violating position rather than a bare true/false.
+
+    Production code uses the same path: Limiter wraps this clock in its normal
+    time-source boundary (no test-only copy of the deadline/delay math).
+    """
+
+    #: backwards movement is rejected (default monotonic policy)
+    RAISE = "raise"
+    #: backwards movement is accepted (simulates a corrected wall clock)
+    ALLOW = "allow"
+    #: backwards movement is clamped to a no-op
+    CLAMP = "clamp"
+
+    def __init__(
+        self,
+        start_ms: int = 0,
+        *,
+        on_backwards: str = RAISE,
+        on_sleep: Optional[Callable[[float], None]] = None,
+    ):
+        if on_backwards not in (self.RAISE, self.ALLOW, self.CLAMP):
+            raise ValueError(f"invalid on_backwards policy: {on_backwards!r}")
+        self._now_ms = int(start_ms)
+        self._on_backwards = on_backwards
+        self._on_sleep = on_sleep
+        self._cond = threading.Condition()
+        self.history: List[str] = []
+
+    def now(self) -> int:
+        with self._cond:
+            value = self._now_ms
+        self.history.append(f"now->{value}")
+        return value
+
+    def advance(self, delta_ms: Union[int, float]) -> int:
+        """Move time forward by ``delta_ms`` (non-negative under RAISE)."""
+        if delta_ms < 0:
+            if self._on_backwards == self.RAISE:
+                raise ValueError("VirtualClock is monotonic: cannot advance backwards")
+            if self._on_backwards == self.CLAMP:
+                delta_ms = 0
+        return self._move(int(delta_ms))
+
+    def move_back(self, delta_ms: Union[int, float]) -> int:
+        """Explicitly model a clock correction of ``-delta_ms``.
+
+        Applies the ``on_backwards`` policy chosen at construction and returns
+        the resulting time, so callers can assert the chosen strategy instead
+        of guessing it.
+        """
+        if delta_ms < 0:
+            raise ValueError("Invalid move_back delta: must be >= 0")
+        if self._on_backwards == self.RAISE:
+            raise ValueError("VirtualClock policy rejects backwards movement")
+        if self._on_backwards == self.CLAMP:
+            return self._move(0)
+        return self._move(-int(delta_ms))
+
+    def _move(self, delta_ms: int) -> int:
+        with self._cond:
+            self._now_ms += delta_ms
+            value = self._now_ms
+            self._cond.notify_all()
+        self.history.append(f"advance->{value}")
+        return value
+
+    def wait_until(self, target_ms: int, timeout: Optional[float] = None) -> bool:
+        """Block a real test thread until virtual time reaches ``target_ms``.
+
+        Used with barriers so concurrent blocking acquirers can be parked at an
+        exact virtual instant. Returns False on timeout.
+        """
+        with self._cond:
+            return self._cond.wait_for(lambda: self._now_ms >= target_ms, timeout=timeout)
+
+    def sleep(self, seconds: Union[int, float]) -> None:
+        """Limiter sync-wait hook: advance virtual time, never block real time."""
+        if seconds < 0:
+            raise ValueError("sleep length must be non-negative")
+        delta_ms = int(seconds * 1000)
+        self._move(delta_ms)
+        if self._on_sleep is not None:
+            self._on_sleep(seconds)
+
+    async def asleep(self, seconds: Union[int, float]) -> None:
+        """Limiter async-wait hook: advance virtual time, yield to the loop.
+
+        Time advances one millisecond per event-loop yield, so other tasks
+        blocked on this acquire get scheduled at each new virtual instant and
+        nothing blocks the event loop for real. Cancellation propagates at a
+        yield boundary, so a cancelled wait can never push the clock past the
+        point the cancelled task had actually reached (and hence can never
+        spend a permit on its behalf).
+        """
+        if seconds < 0:
+            raise ValueError("sleep duration must be non-negative")
+        remaining_ms = int(seconds * 1000)
+        if remaining_ms == 0:
+            # Still yields once, matching asyncio.sleep(0).
+            await asyncio.sleep(0)
+            return
+        while remaining_ms > 0:
+            self._move(1)
+            remaining_ms -= 1
+            if self._on_sleep is not None:
+                self._on_sleep(0.001)
+            await asyncio.sleep(0)
 
 
 class PostgresClock(AbstractClock):
