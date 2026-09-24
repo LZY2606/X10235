@@ -62,6 +62,44 @@ class MonotonicAsyncClock(AbstractClock):
         return self._get_monotonic_ms()
 
 
+class VirtualClock(AbstractClock):
+    """Manually driven monotonic clock, meant for testing only.
+
+    Time is advanced explicitly via ``advance()``/``set()`` so tests can
+    place items exactly on window boundaries without real sleeps. The clock
+    never goes backwards - that is the consistent backwards policy shared by
+    every consumer: ``set()`` to an earlier timestamp is clamped to the
+    current reading (and logged), so buckets and limiters can never observe
+    time moving in reverse through this clock.
+    """
+
+    def __init__(self, start_ms: int = 0):
+        assert start_ms >= 0, "VirtualClock start must be >= 0"
+        self._now_ms = start_ms
+
+    def now(self) -> int:
+        """Current virtual time in milliseconds"""
+        return self._now_ms
+
+    def advance(self, delta_ms: int) -> int:
+        """Move forward by ``delta_ms``; returns the new reading."""
+        assert delta_ms >= 0, "VirtualClock can only advance forwards"
+        self._now_ms += delta_ms
+        return self._now_ms
+
+    def set(self, timestamp_ms: int) -> int:
+        """Move to an absolute timestamp; backwards moves are clamped."""
+        if timestamp_ms < self._now_ms:
+            logger.warning(
+                "VirtualClock: refusing to move backwards from %d to %d; clamping",
+                self._now_ms,
+                timestamp_ms,
+            )
+            return self._now_ms
+        self._now_ms = timestamp_ms
+        return self._now_ms
+
+
 class PostgresClock(AbstractClock):
     """Get timestamp using Postgres as remote clock backend"""
 
