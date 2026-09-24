@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from abc import ABC, abstractmethod
 from time import monotonic_ns, time_ns
 from typing import TYPE_CHECKING, Awaitable, Union
@@ -60,6 +61,53 @@ class MonotonicAsyncClock(AbstractClock):
     async def now(self) -> int:
         """Get monotonic time in milliseconds"""
         return self._get_monotonic_ms()
+
+
+class VirtualMonotonicClock(AbstractClock):
+    """Controllable monotonic clock meant for deterministic tests.
+
+    Time advances only when ``advance()`` is called (milliseconds), so rate
+    limiting can be driven purely by virtual time. The clock is *strictly
+    monotonic at its own boundary*: ``advance()`` rejects a negative delta and
+    a direct ``set()`` below the current reading. Code that needs to feed it a
+    (possibly regressing) wall clock does so through the limiter's internal
+    time boundary, which enforces the monotonic policy with a clamp.
+
+    Sync ``now()`` is safe to call from both threads and event loops, which is
+    what makes one injected clock serve both sync and async limiters.
+    """
+
+    def __init__(self, start_ms: int = 1_000_000_000_000):
+        if start_ms < 0:
+            raise ValueError("start_ms must be >= 0")
+        self._lock = threading.RLock()
+        self._now = int(start_ms)
+
+    def now(self) -> int:
+        """Current virtual time in milliseconds."""
+        with self._lock:
+            return self._now
+
+    def advance(self, delta_ms: int) -> int:
+        """Move the clock forward by ``delta_ms`` milliseconds; return the new reading.
+
+        A negative delta is explicitly unsupported (never silently interpreted
+        as a successful jump): callers asking for backwards motion must use
+        ``set()`` and handle the ``ValueError``.
+        """
+        if delta_ms < 0:
+            raise ValueError("VirtualMonotonicClock cannot move backwards")
+        with self._lock:
+            self._now += int(delta_ms)
+            return self._now
+
+    def set(self, value_ms: int) -> int:
+        """Set an absolute reading, refusing values below the current one."""
+        with self._lock:
+            if value_ms < self._now:
+                raise ValueError("VirtualMonotonicClock cannot move backwards")
+            self._now = int(value_ms)
+            return self._now
 
 
 class PostgresClock(AbstractClock):

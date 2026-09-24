@@ -6,11 +6,13 @@ from contextlib import contextmanager
 from functools import wraps
 from inspect import isawaitable, iscoroutine, iscoroutinefunction
 from threading import RLock, local
-from time import monotonic, sleep
+from time import monotonic
 from typing import Any, Awaitable, Callable, Iterable, List, Optional, Protocol, Tuple, Union
 
+from ._runtime import TimeService, plan_delay_step, wait_to_sleep_ms
 from .abstracts import AbstractBucket, BucketFactory, Rate, RateItem
 from .buckets import InMemoryBucket
+from .clocks import AbstractClock
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +74,13 @@ class SingleBucketFactory(BucketFactory):
 
 
 @contextmanager
-def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeout: int | float = -1):
+def combined_lock(
+    locks: Union[Iterable[LockLike], RLock],
+    blocking: bool,
+    timeout: int | float = -1,
+    *,
+    now: Callable[[], float] = monotonic,
+):
     if not isinstance(locks, Iterable):
         acquired_ok = locks.acquire(blocking=blocking, timeout=timeout)
         if not acquired_ok:
@@ -84,7 +92,7 @@ def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeo
 
     else:
         acquired_locks = []
-        deadline = monotonic() + timeout if blocking and timeout != -1 else None
+        deadline = now() + timeout if blocking and timeout != -1 else None
         try:
             for lock in locks:
                 if not blocking:
@@ -93,7 +101,7 @@ def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeo
                     ok = lock.acquire()
                 else:
                     assert deadline is not None
-                    remaining = max(0.0, deadline - monotonic())
+                    remaining = max(0.0, deadline - now())
                     ok = lock.acquire(timeout=remaining)
 
                 if not ok:
@@ -106,22 +114,11 @@ def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeo
 
 
 def _plan_delay_step(deadline: Optional[float], delay_ms: Union[int, float]) -> Tuple[float, bool]:
-    """Plan one delay step for `_delay_waiter`.
-
-    Returns ``(seconds_to_sleep, raise_timeout_after_sleep)``. Raises
-    ``TimeoutError`` immediately (no sleep) when the deadline has already
-    passed. This is the deadline math shared verbatim by the sync and async
-    branches of `_delay_waiter`; the caller performs the actual sleep with its
-    own primitive (`time.sleep` vs `asyncio.sleep`) and re-raises afterwards.
-    """
-    if deadline is None:
-        return delay_ms / 1000, False
-    remaining_ms = (deadline - monotonic()) * 1000
-    if remaining_ms <= 0:
-        raise TimeoutError()
-    if remaining_ms < delay_ms:
-        return remaining_ms / 1000, True
-    return delay_ms / 1000, False
+    """Backward-compatible alias of the converged deadline step in
+    :mod:`pyrate_limiter._runtime`; kept for code/tests that import it from
+    here. The Limiter itself routes through ``TimeService.plan_step`` so a
+    virtual clock governs the math as well."""
+    return plan_delay_step(deadline, delay_ms)
 
 
 class Limiter:
@@ -140,18 +137,28 @@ class Limiter:
         self,
         argument: Union[BucketFactory, AbstractBucket, Rate, List[Rate]],
         buffer_ms: int = 50,
+        *,
+        _clock: Optional[AbstractClock] = None,
     ):
         """Init Limiter using either a single bucket / multiple-bucket factory
         / single rate / rate list.
 
         Parameters:
             argument (Union[BucketFactory, AbstractBucket, Rate, List[Rate]]): The bucket or rate configuration.
+
+        ``_clock`` is a private test seam: pass the same
+        :class:`~pyrate_limiter.clocks.AbstractClock` (e.g. a
+        ``VirtualMonotonicClock``) to both the bucket and the limiter to drive
+        timestamps, deadline math and sleeps with deterministic virtual time.
+        It routes through the same :class:`~pyrate_limiter._runtime.TimeService`
+        boundary the production path uses - there is no separate test code.
         """
 
         self.buffer_ms = buffer_ms
         self.bucket_factory = self._init_bucket_factory(argument)
         self.lock = RLock()
         self._thread_local = local()
+        self._time = TimeService(_clock)
 
         if isinstance(argument, AbstractBucket):
             limiter_lock = argument.limiter_lock()
@@ -199,11 +206,7 @@ class Limiter:
         identical - previously the async branch asserted ``d >= 0`` while the
         sync branch clamped negatives to 0.
         """
-        if delay == -1:
-            return None
-        if delay < 0:
-            delay = 0
-        return delay + self.buffer_ms
+        return wait_to_sleep_ms(delay, self.buffer_ms)
 
     def _delay_waiter(
         self, bucket: AbstractBucket, item: RateItem, blocking: bool, _force_async: bool = False, deadline: Optional[float] = None
@@ -220,10 +223,8 @@ class Limiter:
 
             async def _handle_async(delay):
                 while True:
-                    if deadline is not None:
-                        remaining_ms = (deadline - monotonic()) * 1000
-                        if remaining_ms <= 0:
-                            raise TimeoutError()
+                    if self._time.is_expired(deadline):
+                        raise TimeoutError()
 
                     d = await self._handle_async_result(delay, deadline=deadline) if isawaitable(delay) else delay
                     assert isinstance(d, int)
@@ -232,8 +233,8 @@ class Limiter:
                         return False
                     d = sleep_ms
 
-                    secs, timed_out = _plan_delay_step(deadline, d)
-                    await asyncio.sleep(secs)
+                    secs, timed_out = self._time.plan_step(deadline, d)
+                    await self._time.async_sleep(secs)
                     if timed_out:
                         raise TimeoutError()
 
@@ -258,8 +259,8 @@ class Limiter:
                 delay = sleep_ms
                 total_delay += delay
 
-                secs, timed_out = _plan_delay_step(deadline, delay)
-                sleep(secs)
+                secs, timed_out = self._time.plan_step(deadline, delay)
+                self._time.sleep(secs)
                 if timed_out:
                     raise TimeoutError()
 
@@ -339,15 +340,15 @@ class Limiter:
             if sleep_ms is None:
                 return False
 
-            secs, timed_out = _plan_delay_step(deadline, sleep_ms)
-            sleep(secs)  # lock intentionally NOT held during the sleep
+            secs, timed_out = self._time.plan_step(deadline, sleep_ms)
+            self._time.sleep(secs)  # lock intentionally NOT held during the sleep
             if timed_out:
                 raise TimeoutError()
 
             item.timestamp += sleep_ms
-            remaining: Union[int, float] = -1 if deadline is None else max(0.0, deadline - monotonic())
+            remaining: Union[int, float] = -1 if deadline is None else max(0.0, deadline - self._time.monotonic())
 
-            with combined_lock(self.lock, blocking=True, timeout=remaining):
+            with combined_lock(self.lock, blocking=True, timeout=remaining, now=self._time.monotonic):
                 re_acquire = bucket.put(item)
 
                 if isawaitable(re_acquire):
@@ -526,7 +527,7 @@ class Limiter:
                     result = await result
                     continue
 
-                remaining = deadline - monotonic()
+                remaining = self._time.remaining(deadline)
                 if remaining <= 0:
                     timed_out = True
                     _cancel_if_pending(result)
@@ -577,9 +578,9 @@ class Limiter:
         Return true on success, false on failure
         """
 
-        deadline: Optional[float] = monotonic() + timeout if timeout != -1 else None
+        deadline = self._time.deadline(timeout)
 
-        with combined_lock(self.lock, blocking=blocking, timeout=timeout):
+        with combined_lock(self.lock, blocking=blocking, timeout=timeout, now=self._time.monotonic):
             assert weight >= 0, "item's weight must be >= 0"
 
             if weight == 0:
