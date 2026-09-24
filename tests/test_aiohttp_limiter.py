@@ -1,8 +1,11 @@
 """Tests for aiohttp_limiter close() method"""
 import pytest
 from pyrate_limiter import Limiter, Rate
-from pyrate_limiter.extras.aiohttp_limiter import RateLimitedSession
 from .conftest import DEFAULT_RATES
+
+pytest.importorskip("aiohttp")
+
+from pyrate_limiter.extras.aiohttp_limiter import RateLimitedSession
 
 
 @pytest.mark.asyncio
