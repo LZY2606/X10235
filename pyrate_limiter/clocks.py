@@ -42,6 +42,46 @@ class MonotonicClock(AbstractClock):
         return self._get_monotonic_ms()
 
 
+class VirtualClock(AbstractClock):
+    """Manually-driven monotonic clock, meant for testing only.
+
+    Time never moves on its own - only when the test calls ``advance()`` or
+    ``set()`` - which makes limiter/bucket timing fully deterministic. A
+    single instance can drive both sides of an acquire:
+
+    - ``now()`` returns milliseconds (the ``AbstractClock`` contract), so the
+      clock can be injected into a bucket (e.g. ``InMemoryBucket(rates,
+      clock=...)``) where it feeds ``AbstractBucket.now()``.
+    - ``monotonic()`` returns the same reading in fractional seconds, matching
+      the zero-argument callable ``Limiter(clock=...)`` expects for its
+      deadline/wait timing.
+
+    The clock may be moved backwards (``set()``/negative ``advance()``) to
+    exercise clock-regression handling; the limiter's policy is that a
+    backwards clock only ever extends a wait, never skips one.
+    """
+
+    def __init__(self, start_ms: int = 0):
+        self._now_ms = start_ms
+
+    def now(self) -> int:
+        """Current virtual time in milliseconds"""
+        return self._now_ms
+
+    def monotonic(self) -> float:
+        """Current virtual time in fractional seconds (Limiter clock protocol)"""
+        return self._now_ms / 1000
+
+    def advance(self, delta_ms: int) -> int:
+        """Move the clock by ``delta_ms`` (may be negative); return new time"""
+        self._now_ms += delta_ms
+        return self._now_ms
+
+    def set(self, now_ms: int) -> None:
+        """Jump the clock to an absolute virtual time in milliseconds"""
+        self._now_ms = now_ms
+
+
 class WallClock(AbstractClock):
     """Wall-clock epoch milliseconds.
 

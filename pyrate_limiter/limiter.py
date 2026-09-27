@@ -105,7 +105,11 @@ def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeo
                 lock.release()
 
 
-def _plan_delay_step(deadline: Optional[float], delay_ms: Union[int, float]) -> Tuple[float, bool]:
+def _plan_delay_step(
+    deadline: Optional[float],
+    delay_ms: Union[int, float],
+    now: Optional[float] = None,
+) -> Tuple[float, bool]:
     """Plan one delay step for `_delay_waiter`.
 
     Returns ``(seconds_to_sleep, raise_timeout_after_sleep)``. Raises
@@ -113,10 +117,15 @@ def _plan_delay_step(deadline: Optional[float], delay_ms: Union[int, float]) -> 
     passed. This is the deadline math shared verbatim by the sync and async
     branches of `_delay_waiter`; the caller performs the actual sleep with its
     own primitive (`time.sleep` vs `asyncio.sleep`) and re-raises afterwards.
+
+    ``now`` is the current monotonic-seconds reading; when ``None`` the real
+    monotonic clock is read. Clock-regression policy: a backwards clock only
+    ever inflates ``remaining`` (the wait extends); it can never produce a
+    negative sleep or skip the deadline check.
     """
     if deadline is None:
         return delay_ms / 1000, False
-    remaining_ms = (deadline - monotonic()) * 1000
+    remaining_ms = (deadline - (monotonic() if now is None else now)) * 1000
     if remaining_ms <= 0:
         raise TimeoutError()
     if remaining_ms < delay_ms:
@@ -140,18 +149,27 @@ class Limiter:
         self,
         argument: Union[BucketFactory, AbstractBucket, Rate, List[Rate]],
         buffer_ms: int = 50,
+        clock: Optional[Callable[[], float]] = None,
     ):
         """Init Limiter using either a single bucket / multiple-bucket factory
         / single rate / rate list.
 
         Parameters:
             argument (Union[BucketFactory, AbstractBucket, Rate, List[Rate]]): The bucket or rate configuration.
+            buffer_ms (int): Extra milliseconds added to every computed wait.
+            clock (Optional[Callable[[], float]]): Zero-argument callable
+                returning monotonic time in seconds (like ``time.monotonic``),
+                used for all deadline and wait-step timing. Defaults to
+                ``time.monotonic``. Injectable for tests (e.g. driven by a
+                ``VirtualClock``); the reference is kept per-instance, so
+                clocks never leak between limiters.
         """
 
         self.buffer_ms = buffer_ms
         self.bucket_factory = self._init_bucket_factory(argument)
         self.lock = RLock()
         self._thread_local = local()
+        self._clock: Callable[[], float] = clock if clock is not None else monotonic
 
         if isinstance(argument, AbstractBucket):
             limiter_lock = argument.limiter_lock()
